@@ -139,6 +139,55 @@ def test_get_pin_with_malformed_reasoning_raises(tmp_path: Path) -> None:
         board.get_pin(connection, _TASK_ID)
 
 
+def test_list_queued_orders_priority_then_created_at(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Queued pins sort by priority, then created_at. Other statuses stay out."""
+    board, connection = _open_board(tmp_path)
+    later_low = _pin(task_id="task-later-80", priority=80, created_at="2026-10-04T18:41:00Z")
+    first = _pin(task_id="task-first-10", priority=10, created_at="2026-10-04T18:50:00Z")
+    earlier_low = _pin(task_id="task-early-80", priority=80, created_at="2026-10-04T18:40:00Z")
+    running = _pin(task_id="task-running", priority=1, status="running")
+    completed = _pin(task_id="task-done", priority=1, status="completed")
+    for pin in (later_low, first, earlier_low, running, completed):
+        board.insert_pin(connection, pin)
+    caplog.set_level(logging.INFO, logger="local_ai.blackboard.pins")
+
+    queued = board.list_queued(connection)
+
+    assert [pin.task_id for pin in queued] == ["task-first-10", "task-early-80", "task-later-80"]
+    assert all(pin.status == "queued" for pin in queued)
+    assert any(
+        record.levelno == logging.INFO and "blackboard.list_queued" in record.message and "count=3" in record.message
+        for record in caplog.records
+    )
+
+
+def test_list_queued_with_no_queued_pins_returns_empty(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An empty queue is an empty tuple and logs a zero count."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin(status="running"))
+    caplog.set_level(logging.INFO, logger="local_ai.blackboard.pins")
+
+    assert board.list_queued(connection) == ()
+    assert any(
+        record.levelno == logging.INFO and "count=0" in record.message
+        for record in caplog.records
+    )
+
+
+def test_list_queued_with_a_non_connection_raises(tmp_path: Path) -> None:
+    """The caller must pass the Database connection."""
+    board, _connection = _open_board(tmp_path)
+
+    with pytest.raises(TypeError, match="Connection"):
+        board.list_queued(None)  # type: ignore[arg-type]
+
+
 def test_get_pin_with_a_blank_task_id_raises(tmp_path: Path) -> None:
     """A blank id is rejected before the select."""
     board, connection = _open_board(tmp_path)

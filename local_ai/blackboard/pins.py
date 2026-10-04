@@ -10,6 +10,14 @@ from local_ai.db.database import Database
 
 logger = logging.getLogger(__name__)
 
+_QUEUED = "queued"
+
+_LIST_QUEUED_SQL = """
+SELECT * FROM tasks
+WHERE status = ?
+ORDER BY priority ASC, created_at ASC
+"""
+
 _INSERT_PIN_SQL = """
 INSERT INTO tasks (
     id, priority, status, model, goal, done_when, access_json, phase,
@@ -182,10 +190,13 @@ class Blackboard:
 
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :return: pins as tuple[TaskPin, ...]. Example: ()
+        :raises TypeError: when connection is not a Connection. Example: None
         """
-        # SELECT status='queued' ORDER BY priority ASC, created_at ASC.
-        # Log the count at INFO.
-        raise NotImplementedError
+        _require_connection(connection)
+        rows = connection.execute(_LIST_QUEUED_SQL, (_QUEUED,)).fetchall()
+        pins = tuple(_pin_from_row(row) for row in rows)
+        logger.info("blackboard.list_queued | count=%s", len(pins))
+        return pins
 
 
 def _require_connection(connection: sqlite3.Connection) -> None:
