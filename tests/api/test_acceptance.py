@@ -106,6 +106,67 @@ def test_stdio_client_finishes_a_poem_and_keeps_stdout_json(tmp_path: Path) -> N
     _assert_stdout_is_only_jsonrpc(stdout)
 
 
+_CODE_GOAL = "Write add.py with a function add(left, right) that returns left + right, then run it."
+_CODE_DONE = "python3 add.py prints 5."
+_ADD_PY = "def add(left: int, right: int) -> int:\n    return left + right\n\n\nif __name__ == '__main__':\n    print(add(2, 3))\n"
+
+
+def test_stdio_client_generates_code_that_runs(tmp_path: Path) -> None:
+    """Submit a code task. The generated add.py runs and prints 5."""
+    host, port, server = _start_ollama(_code_script())
+    process = _start_dispatcher(tmp_path, host, port)
+    stdout: list[str] = []
+    try:
+        _send(process, _initialize())
+        _response(process, 1, stdout)
+        _send(process, _initialized())
+        accepted = _tool(process, 2, "submit", _code_submit(), stdout)
+        pin = _poll_until_terminal(process, str(accepted["task_id"]), stdout)
+    finally:
+        _stop(process)
+        server.shutdown()
+
+    job = tmp_path / "jobs" / str(accepted["task_id"])
+    source = (job / "add.py").read_text(encoding="utf-8")
+    assert accepted["status"] == "queued"
+    assert pin["status"] == "completed", pin.get("error")
+    assert pin["goal"] == _CODE_GOAL
+    assert "def add" in source
+    assert "return left + right" in source
+    ran = subprocess.run(
+        [_PYTHON, str(job / "add.py")],
+        cwd=job,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ran.returncode == 0
+    assert ran.stdout.strip() == "5"
+    assert "5" in (job / "shell.log").read_text(encoding="utf-8")
+    _assert_stdout_is_only_jsonrpc(stdout)
+
+
+def _code_script() -> list[dict]:
+    """Plan, write add.py, then run it."""
+    write = "python3 -c " + shlex.quote(f"open('add.py','w').write({_ADD_PY!r})")
+    return [
+        _chat("1. Write add.py\n2. Run python3 add.py", thinking="add returns the sum of its arguments."),
+        _chat("Wrote add.py", thinking="Writing add.py.", command=write),
+        _chat("Printed 5", thinking="Running add.py.", command="python3 add.py"),
+    ]
+
+
+def _code_submit() -> dict:
+    """The submit a person would send to generate add.py."""
+    return {
+        "goal": _CODE_GOAL,
+        "done_when": _CODE_DONE,
+        "priority": 40,
+        "model": "qwen-14b",
+        "access": {"mode": "job"},
+    }
+
+
 def _start_ollama(replies: list[dict]) -> tuple[str, int, ThreadingHTTPServer]:
     """Bind a stand-in Ollama on an ephemeral port."""
     _OllamaHandler.replies = replies
