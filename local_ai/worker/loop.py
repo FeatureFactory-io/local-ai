@@ -154,12 +154,12 @@ class Worker:
         :param order: step order as int. Example: 2
         :param model_name: logical size as str. Example: "qwen-8b"
         :return: "completed" or "failed" as str. Example: "failed"
+        :raises ValueError: when task_id, order, or model_name is unusable. Example: ""
         """
-        # One more LlmPort.complete that asks for a final answer.
-        # A non-empty final_answer completes the step.
-        # An empty answer returns "failed" so run_task can stop the pin.
-        # Log the branch at INFO.
-        raise NotImplementedError
+        logger.info("Starting force_final task_id=%s step=%s", task_id, order)
+        _require_step_args(task_id, order, model_name)
+        completion = self._llm.complete(self._final_prompt(task_id, order), model_name)
+        return self._outcome_from_final(task_id, order, completion)
 
     def adapt_after_failure(self, task_id: str, order: int, model_name: str, error: str) -> None:
         """
@@ -290,6 +290,32 @@ class Worker:
         if not self._round_had_shell:
             return self.force_final(task_id, order, model_name)
         return None
+
+    def _final_prompt(self, task_id: str, order: int) -> str:
+        """
+        Ask the model for a final answer on top of the step prompt.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :return: prompt as str. Example: "Foundation\\n\\nReply with a final answer for this step."
+        """
+        return self._step_prompt(task_id, order) + "\n\nReply with a final answer for this step."
+
+    def _outcome_from_final(self, task_id: str, order: int, completion: Completion) -> str:
+        """
+        Complete the step when the extra turn has a final answer.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :param completion: extra turn as Completion. Example: Completion(final_answer="Found ch-01.md")
+        :return: "completed" or "failed" as str. Example: "failed"
+        """
+        answer = completion.final_answer.strip()
+        if answer:
+            logger.info("worker.force_final | completed | task_id=%s step=%s", task_id, order)
+            return self._complete_open_step(task_id, order, answer)
+        logger.info("worker.force_final | failed | task_id=%s step=%s", task_id, order)
+        return "failed"
 
     def _step_prompt(self, task_id: str, order: int) -> str:
         """

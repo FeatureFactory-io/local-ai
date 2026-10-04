@@ -156,6 +156,55 @@ def test_run_step_at_round_cap_fails_the_step(tmp_path: Path) -> None:
     assert step.error == "max rounds without a final answer"
 
 
+def test_force_final_with_answer_completes_the_step(tmp_path: Path) -> None:
+    """A non-empty final answer completes the running step."""
+    worker, connection, _job_dir = _open_worker(tmp_path, (Completion(final_answer="Found ch-01.md"),))
+    _insert_pending(worker, connection, (StepDraft(1, "List chapter files"),))
+    worker._plan.mark_running(connection, _TASK_ID, 1)
+
+    outcome = worker.force_final(_TASK_ID, 1, "qwen-14b")
+
+    assert outcome == "completed"
+    assert _steps(worker, connection)[0].llm_synthesis == "Found ch-01.md"
+
+
+def test_force_final_with_empty_answer_returns_failed(tmp_path: Path) -> None:
+    """An empty answer returns failed and leaves the step running."""
+    worker, connection, _job_dir = _open_worker(tmp_path, (Completion(),))
+    _insert_pending(worker, connection, (StepDraft(1, "List chapter files"),))
+    worker._plan.mark_running(connection, _TASK_ID, 1)
+
+    outcome = worker.force_final(_TASK_ID, 1, "qwen-14b")
+
+    assert outcome == "failed"
+    assert _steps(worker, connection)[0].status == "running"
+
+
+def test_run_step_without_tool_or_answer_calls_force_final_once(tmp_path: Path) -> None:
+    """An empty round asks once. A second empty answer fails the step's round."""
+    worker, connection, _job_dir = _open_worker(
+        tmp_path,
+        (Completion(), Completion(final_answer="Found ch-01.md")),
+    )
+    _insert_pending(worker, connection, (StepDraft(1, "List chapter files"),))
+
+    outcome = worker.run_step(_TASK_ID, 1, "qwen-14b")
+
+    assert outcome == "completed"
+    assert _steps(worker, connection)[0].status == "completed"
+
+
+def test_run_step_with_empty_force_final_returns_failed(tmp_path: Path) -> None:
+    """Two empty turns ask once and return failed instead of looping."""
+    worker, connection, _job_dir = _open_worker(tmp_path, (Completion(), Completion()))
+    _insert_pending(worker, connection, (StepDraft(1, "List chapter files"),))
+
+    outcome = worker.run_step(_TASK_ID, 1, "qwen-14b")
+
+    assert outcome == "failed"
+    assert _steps(worker, connection)[0].status == "running"
+
+
 def _open_worker(
     tmp_path: Path,
     script: tuple[Completion, ...],
