@@ -335,7 +335,10 @@ def test_run_task_with_shell_tool_and_no_numbered_plan_runs_that_command(tmp_pat
     command = "python3 -c \"open('marker.txt','w').write('python\\n')\""
     worker, connection, job_dir = _open_worker(
         tmp_path,
-        (Completion(thinking="Writing marker.txt.", tool_calls=(ToolCall("shell", command),)),),
+        (
+            Completion(thinking="Writing marker.txt.", tool_calls=(ToolCall("shell", command),)),
+            Completion(final_answer="marker.txt is written"),
+        ),
     )
 
     outcome = worker.run_task(_TASK_ID)
@@ -343,6 +346,45 @@ def test_run_task_with_shell_tool_and_no_numbered_plan_runs_that_command(tmp_pat
     assert outcome == "completed"
     assert (job_dir / "marker.txt").read_text(encoding="utf-8") == "python\n"
     assert [(step.order, step.status) for step in _steps(worker, connection)] == [(1, "completed")]
+
+
+def test_shell_only_plan_does_not_finish_when_the_goal_is_still_open(tmp_path: Path) -> None:
+    """A planning shell that exits 0 stays open until a later turn meets the goal."""
+    dump = "python3 -c \"open('marker.txt','w').write('raw extract\\n')\""
+    thesis = "python3 -c \"open('marker.txt','w').write('The thesis is the canvas.\\n')\""
+    worker, connection, job_dir = _open_worker(
+        tmp_path,
+        (
+            Completion(tool_calls=(ToolCall("shell", dump),)),
+            Completion(content="1. Write the thesis into marker.txt"),
+            Completion(tool_calls=(ToolCall("shell", thesis),), final_answer="Wrote the thesis."),
+        ),
+    )
+
+    outcome = worker.run_task(_TASK_ID)
+
+    assert outcome == "completed"
+    assert (job_dir / "marker.txt").read_text(encoding="utf-8") == "The thesis is the canvas.\n"
+    assert [step.status for step in _steps(worker, connection)] == ["completed", "completed"]
+
+
+def test_shell_only_plan_fails_when_the_model_stops_after_the_command(tmp_path: Path) -> None:
+    """Exit 0 on the planning command does not complete the pin."""
+    command = "python3 -c \"open('marker.txt','w').write('raw extract\\n')\""
+    worker, connection, job_dir = _open_worker(
+        tmp_path,
+        (
+            Completion(tool_calls=(ToolCall("shell", command),)),
+            Completion(),
+        ),
+    )
+
+    outcome = worker.run_task(_TASK_ID)
+
+    assert outcome == "failed"
+    assert worker.failure_reason == "shell_plan_not_the_goal"
+    assert (job_dir / "marker.txt").read_text(encoding="utf-8") == "raw extract\n"
+    assert [step.status for step in _steps(worker, connection)] == ["completed"]
 
 
 def test_run_task_retries_when_the_recovery_turn_is_a_shell_command(tmp_path: Path) -> None:
@@ -353,6 +395,7 @@ def test_run_task_retries_when_the_recovery_turn_is_a_shell_command(tmp_path: Pa
         (
             Completion(tool_calls=(ToolCall("shell", "false"),)),
             Completion(tool_calls=(ToolCall("shell", good),)),
+            Completion(final_answer="marker.txt is written"),
         ),
     )
 
