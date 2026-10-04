@@ -5,7 +5,7 @@ import logging
 import pytest
 
 from local_ai.contracts import Completion, ScriptExhausted
-from local_ai.llm.port import LiteLLMAdapter, ScriptedLLM, resolve_model_tag, split_note
+from local_ai.llm.port import ScriptedLLM, resolve_model_tag, split_note
 
 
 def test_scripted_llm_complete_returns_turns_in_order_then_raises() -> None:
@@ -49,21 +49,6 @@ def test_scripted_llm_complete_rejects_a_non_string_prompt() -> None:
     with pytest.raises(ValueError):
         llm.complete(None, "qwen-8b")  # type: ignore[arg-type]
     assert llm.complete("Foundation\nTask", "qwen-8b").content == "List the files."
-
-
-def test_litellm_adapter_complete_still_raises_not_implemented() -> None:
-    """Plan A does not call LiteLLM. complete stays a stub until Plan B."""
-
-    def fail_if_called(*args: object, **kwargs: object) -> None:
-        raise AssertionError(f"live complete must not be called args={args} kwargs={kwargs}")
-
-    adapter = LiteLLMAdapter(
-        complete_fn=fail_if_called,
-        env={"LOCAL_AI_MODEL_14B": "qwen2.5:14b"},
-        ollama_host="http://127.0.0.1:11434",
-    )
-    with pytest.raises(NotImplementedError):
-        adapter.complete("Foundation\nTask", "qwen-14b")
 
 
 def test_split_note_returns_thinking_when_present() -> None:
