@@ -12,6 +12,13 @@ logger = logging.getLogger(__name__)
 
 _QUEUED = "queued"
 _RUNNING = "running"
+_TERMINAL_STATUSES = ("completed", "failed")
+
+_SET_FINAL_SQL = """
+UPDATE tasks
+SET status = ?, phase = ?, final_status = ?, error = ?, artifacts_json = ?, finished_at = ?
+WHERE id = ?
+"""
 _TRUNCATION_TEXT = "earlier notes were truncated"
 _TRUNCATION_AT = "2026-10-04T00:00:00Z"
 
@@ -156,10 +163,14 @@ class Blackboard:
         :param artifacts: output paths as tuple[str, ...]. Example: ("/tmp/summary.md",)
         :param finished_at: stop time as str. Example: "2026-10-04T18:55:00Z"
         :return: None. Example: None
+        :raises TypeError: when connection, error, or artifacts has the wrong type. Example: "/tmp/summary.md"
+        :raises ValueError: when status is not completed or failed, or the pin is missing. Example: "running"
         """
-        # Set status, phase, final_status, error, artifacts_json, and finished_at together.
-        # Log task_id and status at INFO.
-        raise NotImplementedError
+        _require_connection(connection)
+        _require_task_id(task_id)
+        _require_terminal(status)
+        _finish_row(connection, task_id, status, error, artifacts, finished_at)
+        logger.info("blackboard.set_final | task_id=%s | status=%s", task_id, status)
 
     def update_priority(self, connection: sqlite3.Connection, task_id: str, priority: int) -> None:
         """
@@ -257,6 +268,50 @@ def _require_pin(pin: TaskPin) -> None:
     _require_task_id(pin.task_id)
     if not isinstance(pin.access, AccessGrant):
         raise TypeError("pin.access must be AccessGrant. Example: AccessGrant('job')")
+
+
+def _require_terminal(status: object) -> None:
+    """
+    Accept only completed or failed.
+
+    :param status: candidate status as object. Example: "completed"
+    :return: None. Example: None
+    :raises ValueError: when status is not terminal. Example: "running"
+    """
+    if status not in _TERMINAL_STATUSES:
+        raise ValueError("status must be completed or failed. Example: 'completed'")
+
+
+def _finish_row(
+    connection: sqlite3.Connection,
+    task_id: str,
+    status: str,
+    error: str,
+    artifacts: tuple[str, ...],
+    finished_at: str,
+) -> None:
+    """
+    Write the terminal columns. Phase uses the same word as status.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param status: completed or failed as str. Example: "completed"
+    :param error: failure summary as str. Example: ""
+    :param artifacts: output paths as tuple[str, ...]. Example: ("/tmp/summary.md",)
+    :param finished_at: stop time as str. Example: "2026-10-04T18:55:00Z"
+    :return: None. Example: None
+    :raises TypeError: when error or artifacts has the wrong type. Example: "/tmp/summary.md"
+    :raises ValueError: when finished_at is blank or the pin is missing. Example: " "
+    """
+    if not isinstance(error, str):
+        raise TypeError("error must be str. Example: ''")
+    _require_text(finished_at, "finished_at", "2026-10-04T18:55:00Z")
+    _update_one(
+        connection,
+        _SET_FINAL_SQL,
+        (status, status, status, error, _dump_artifacts(artifacts), finished_at, task_id),
+        task_id,
+    )
 
 
 def _running_ids(connection: sqlite3.Connection) -> tuple[str, ...]:

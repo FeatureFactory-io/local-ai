@@ -181,6 +181,82 @@ def test_append_reasoning_with_unknown_id_raises(tmp_path: Path) -> None:
     assert connection.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 0
 
 
+def test_set_final_writes_completed_state(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Status, phase, final_status, artifacts, and finished_at are written together."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+    caplog.set_level(logging.INFO, logger="local_ai.blackboard.pins")
+
+    board.set_final(connection, _TASK_ID, "completed", "", ("/tmp/summary.md",), "2026-10-04T18:55:00Z")
+
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.status == "completed"
+    assert loaded.phase == "completed"
+    assert loaded.final_status == "completed"
+    assert loaded.error == ""
+    assert loaded.artifacts == ("/tmp/summary.md",)
+    assert loaded.finished_at == "2026-10-04T18:55:00Z"
+    assert any(
+        record.levelno == logging.INFO
+        and f"task_id={_TASK_ID}" in record.message
+        and "status=completed" in record.message
+        for record in caplog.records
+    )
+
+
+def test_set_final_failed_stores_the_error(tmp_path: Path) -> None:
+    """A failed pin keeps the error summary and an empty artifact list."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+
+    board.set_final(
+        connection,
+        _TASK_ID,
+        "failed",
+        "weasyprint exited non-zero",
+        (),
+        "2026-10-04T18:55:00Z",
+    )
+
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.status == "failed"
+    assert loaded.phase == "failed"
+    assert loaded.final_status == "failed"
+    assert loaded.error == "weasyprint exited non-zero"
+    assert loaded.artifacts == ()
+
+
+def test_set_final_with_unknown_id_raises(tmp_path: Path) -> None:
+    """A missing pin is not created by a final write."""
+    board, connection = _open_board(tmp_path)
+
+    with pytest.raises(ValueError, match="task_id"):
+        board.set_final(connection, _TASK_ID, "completed", "", (), "2026-10-04T18:55:00Z")
+
+
+def test_set_final_with_a_non_terminal_status_raises(tmp_path: Path) -> None:
+    """running is not a terminal status, so the row stays queued."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+
+    with pytest.raises(ValueError, match="completed"):
+        board.set_final(connection, _TASK_ID, "running", "", (), "2026-10-04T18:55:00Z")
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.status == "queued"
+
+
+def test_set_final_with_a_string_artifacts_raises(tmp_path: Path) -> None:
+    """One path must still be a tuple, so a bare string is rejected."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+
+    with pytest.raises(TypeError, match="artifacts"):
+        board.set_final(connection, _TASK_ID, "completed", "", "/tmp/summary.md", "2026-10-04T18:55:00Z")  # type: ignore[arg-type]
+
+
 def test_requeue_running_returns_pins_to_queued(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """Running pins go back to queued. Completed steps and finished pins stay."""
     board, connection = _open_board(tmp_path)
