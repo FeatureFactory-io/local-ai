@@ -58,9 +58,14 @@ class PlanStore:
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :return: steps as tuple[PlanStep, ...]. Example: ()
+        :raises TypeError: when connection is not sqlite3.Connection. Example: None
+        :raises ValueError: when task_id is blank. Example: ""
         """
-        # SELECT by task_id ORDER BY step_order.
-        raise NotImplementedError
+        self._require_connection(connection)
+        self._require_task_id(task_id)
+        steps = tuple(self._plan_step_from_row(row) for row in self._select_steps(connection, task_id))
+        logger.info("PlanStore.list_steps task_id=%s count=%s", task_id, len(steps))
+        return steps
 
     def mark_running(self, connection: sqlite3.Connection, task_id: str, order: int) -> None:
         """
@@ -301,6 +306,43 @@ class PlanStore:
         ).fetchone()
         if row is not None:
             raise ValueError(f"step order {int(row['step_order'])} already exists for task_id={task_id}")
+
+    def _select_steps(self, connection: sqlite3.Connection, task_id: str) -> list[sqlite3.Row]:
+        """
+        Load one pin's steps from lowest order to highest.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :return: rows as list[sqlite3.Row]. Example: []
+        """
+        return list(
+            connection.execute(
+                """
+                SELECT task_id, step_order, action, status, result_json, error, llm_synthesis
+                FROM plan_steps
+                WHERE task_id = ?
+                ORDER BY step_order
+                """,
+                (task_id,),
+            ).fetchall()
+        )
+
+    def _plan_step_from_row(self, row: sqlite3.Row) -> PlanStep:
+        """
+        Map one plan_steps row onto PlanStep.
+
+        :param row: sqlite row as sqlite3.Row. Example: a row with step_order 1
+        :return: step as PlanStep. Example: PlanStep("7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", 1, "List chapter files", "pending")
+        """
+        return PlanStep(
+            task_id=str(row["task_id"]),
+            order=int(row["step_order"]),
+            action=str(row["action"]),
+            status=str(row["status"]),
+            result_json=str(row["result_json"]),
+            error=str(row["error"]),
+            llm_synthesis=str(row["llm_synthesis"]),
+        )
 
     def _write_pending_steps(
         self,

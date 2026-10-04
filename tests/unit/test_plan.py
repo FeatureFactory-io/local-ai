@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from local_ai.contracts import StepDraft
+from local_ai.contracts import PlanStep, StepDraft
 from local_ai.db.database import Database
 from local_ai.plan.steps import PlanStore
 
@@ -99,6 +99,74 @@ def test_insert_steps_rejects_bad_inputs(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="task_id"):
         store.insert_steps(connection, "", (StepDraft(1, "List chapter files"),))
     assert _step_rows(connection, _TASK_ID) == []
+
+
+def test_list_steps_returns_rows_ordered_by_step_order(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """list_steps returns PlanStep rows for one pin, lowest order first."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(
+        connection,
+        _TASK_ID,
+        (
+            StepDraft(3, "Assemble summary.md"),
+            StepDraft(1, "List chapter files"),
+            StepDraft(2, "Write a thesis per chapter"),
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE plan_steps
+        SET result_json = ?, error = ?, llm_synthesis = ?
+        WHERE task_id = ? AND step_order = ?
+        """,
+        ('{"success": true}', "", "Found ch-01.md through ch-12.md", _TASK_ID, 1),
+    )
+
+    with caplog.at_level(logging.INFO, logger="local_ai.plan.steps"):
+        steps = store.list_steps(connection, _TASK_ID)
+
+    assert steps == (
+        PlanStep(
+            _TASK_ID,
+            1,
+            "List chapter files",
+            "pending",
+            '{"success": true}',
+            "",
+            "Found ch-01.md through ch-12.md",
+        ),
+        PlanStep(_TASK_ID, 2, "Write a thesis per chapter", "pending"),
+        PlanStep(_TASK_ID, 3, "Assemble summary.md", "pending"),
+    )
+    assert _TASK_ID in caplog.text
+    assert "count=3" in caplog.text
+
+
+def test_list_steps_returns_empty_for_a_pin_with_no_steps(tmp_path: Path) -> None:
+    """A pin with no plan returns an empty tuple."""
+    store, connection = _open_store(tmp_path)
+
+    assert store.list_steps(connection, _TASK_ID) == ()
+
+
+def test_list_steps_ignores_another_pins_steps(tmp_path: Path) -> None:
+    """Rows for a different task_id stay out of the result."""
+    store, connection = _open_store(tmp_path)
+    _insert_task(connection, _OTHER_TASK_ID)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(1, "List chapter files"),))
+    store.insert_steps(connection, _OTHER_TASK_ID, (StepDraft(1, "Export pdf"),))
+
+    steps = store.list_steps(connection, _TASK_ID)
+
+    assert steps == (PlanStep(_TASK_ID, 1, "List chapter files", "pending"),)
+
+
+def test_list_steps_rejects_a_blank_task_id(tmp_path: Path) -> None:
+    """A blank pin id is not a query."""
+    store, connection = _open_store(tmp_path)
+
+    with pytest.raises(ValueError, match="task_id"):
+        store.list_steps(connection, "  ")
 
 
 def test_insert_steps_requires_the_parent_pin(tmp_path: Path) -> None:
