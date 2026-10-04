@@ -273,10 +273,12 @@ def validate_model(name: str) -> str:
     :return: the same name as str. Example: "qwen-14b"
     :raises InvalidModel: when name is not in MODEL_NAMES. Example: "qwen-70b"
     """
-    # Accept only MODEL_NAMES.
-    # Reject anything else with InvalidModel.
-    # Log the accepted name at INFO.
-    raise NotImplementedError
+    logger.info("Starting validate_model name=%s", name)
+    if type(name) is not str or name not in MODEL_NAMES:
+        logger.info("Rejecting model branch=unknown name=%s", name)
+        raise InvalidModel(f"model {name!r} is not one of {MODEL_NAMES}")
+    logger.info("Accepted model name=%s", name)
+    return name
 
 
 def default_grant(access: dict | None) -> AccessGrant:
