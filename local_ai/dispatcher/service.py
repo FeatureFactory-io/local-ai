@@ -3,12 +3,31 @@
 import logging
 import shutil
 import sqlite3
+import uuid
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 from local_ai.blackboard.pins import Blackboard
-from local_ai.capacity.reader import CapacityReader
-from local_ai.contracts import SubmitRequest, TaskPin
+from local_ai.capacity.reader import (
+    OLLAMA_DOWN,
+    RECOMMENDATION_NONE,
+    CapacityReader,
+    HttpReader,
+    MemoryReader,
+    PressureReader,
+)
+from local_ai.contracts import (
+    AccessGrant,
+    InvalidModel,
+    SubmitRequest,
+    TaskPin,
+    default_grant,
+    validate_model,
+    validate_priority,
+)
 from local_ai.db.database import Database
+from local_ai.dispatcher.queue import queue_position
 from local_ai.plan.steps import PlanStore
 
 
@@ -16,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 _GRANT_MODES = ("job", "paths", "home")
 _JOB_MODE = "job"
+_STATUS_QUEUED = "queued"
+_PHASE_QUEUED = "queued"
+_REASON_OLLAMA_DOWN = "ollama_down"
+_REASON_MODEL_UNAVAILABLE = "model_unavailable"
 
 
 class DispatcherService:
@@ -33,6 +56,11 @@ class DispatcherService:
         plan: PlanStore,
         capacity: CapacityReader,
         jobs_root: Path,
+        memory: MemoryReader | None = None,
+        ollama: HttpReader | None = None,
+        pressure: PressureReader | None = None,
+        ollama_host: str | None = None,
+        clock: Callable[[], str] | None = None,
     ) -> None:
         """
         Store collaborators.
@@ -42,27 +70,74 @@ class DispatcherService:
         :param plan: step store as PlanStore. Example: PlanStore(database)
         :param capacity: memory and Ollama reader as CapacityReader. Example: CapacityReader()
         :param jobs_root: job directory root as Path. Example: Path("data/jobs")
+        :param memory: returns (total_gb, free_gb) as MemoryReader | None. Example: lambda: (64.0, 40.2)
+        :param ollama: HTTP reader as HttpReader | None. Example: lambda path: (200, {"models": []})
+        :param pressure: pressure reader as PressureReader | None. Example: lambda: "normal"
+        :param ollama_host: base URL as str | None. Example: "http://127.0.0.1:11434"
+        :param clock: UTC timestamp source as Callable[[], str] | None. Example: lambda: "2026-10-04T18:40:00Z"
         """
         self._database = database
         self._blackboard = blackboard
         self._plan = plan
         self._capacity = capacity
         self._jobs_root = jobs_root
+        self._memory = memory
+        self._ollama = ollama
+        self._pressure = pressure
+        self._ollama_host = ollama_host
+        self._clock = _utc_timestamp if clock is None else clock
 
     def submit(self, request: SubmitRequest, connection: sqlite3.Connection) -> dict:
         """
         Pin a task and return the queued snapshot. The slot kicks after this returns the dict.
 
+        Ollama down returns status rejected, reason ollama_down, and task_id null.
+        Recommended none with no model returns status rejected and reason model_unavailable.
+        Neither rejection inserts a pin. This method does not start the worker.
+
         :param request: submit arguments as SubmitRequest. Example: SubmitRequest("Write a brief.", "brief.md exists")
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :return: queued or rejected body as dict. Example: {"status": "queued", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", "position": 1}
+        :raises TypeError: when request is not a SubmitRequest. Example: {}
+        :raises InvalidPriority: when priority is outside 1..100. Example: 0
+        :raises InvalidModel: when the model name is unknown. Example: "qwen-70b"
+        :raises InvalidAccess: when the grant mode is unknown. Example: {"mode": "root"}
+        :raises RuntimeError: when the capacity ports were not stored. Example: memory=None
         """
-        # Call CapacityReader.read. ollama down returns status rejected, reason ollama_down, task_id null.
-        # validate_priority, default_grant. A missing model uses recommended. recommended "none" rejects.
-        # validate_model. copy_job_inputs. Blackboard.insert_pin with status queued.
-        # queue_position. Log dispatcher.submit with task_id, priority, model, and grant mode.
-        # Return the queued snapshot. Do not call the worker here.
-        raise NotImplementedError
+        _require_submit_request(request)
+        reading = _capacity_reading(
+            self._capacity, self._memory, self._ollama, self._pressure, self._ollama_host
+        )
+        rejected = _capacity_rejection(reading, request.model)
+        if rejected is not None:
+            logger.info("dispatcher.submit | rejected | reason=%s", rejected["reason"])
+            return rejected
+        return self._enqueue(request, connection, reading)
+
+    def _enqueue(self, request: SubmitRequest, connection: sqlite3.Connection, reading: dict) -> dict:
+        """
+        Validate, copy inputs, insert the queued pin, and return its snapshot.
+
+        :param request: submit arguments as SubmitRequest. Example: SubmitRequest("Write a brief.", "brief.md exists")
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param reading: capacity body as dict. Example: {"ollama": "up", "recommended": "qwen-14b"}
+        :return: queued body as dict. Example: {"status": "queued", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", "position": 1}
+        :raises InvalidPriority: when priority is outside 1..100. Example: 0
+        :raises InvalidModel: when the model name is unknown. Example: "qwen-70b"
+        :raises InvalidAccess: when the grant mode is unknown. Example: {"mode": "root"}
+        :raises TypeError: when connection is not a Connection. Example: None
+        """
+        priority = validate_priority(request.priority)
+        grant = default_grant(request.access)
+        model = validate_model(_chosen_model(request.model, reading))
+        _require_connection(connection)
+        task_id = str(uuid.uuid4())
+        pin = _queued_pin(task_id, request, priority, model, grant, _timestamp(self._clock))
+        self.copy_job_inputs(task_id, request.inputs, grant.mode)
+        self._blackboard.insert_pin(connection, pin)
+        position = queue_position(pin, self._blackboard.list_queued(connection))
+        _log_submit(task_id, priority, model, grant.mode)
+        return _queued_body(pin, position)
 
     def copy_job_inputs(self, task_id: str, inputs: tuple[str, ...], grant_mode: str) -> Path:
         """
@@ -246,3 +321,213 @@ def _copy_one_file(raw: object, directory: Path) -> None:
         return
     shutil.copy2(source, directory / source.name)
     logger.info("dispatcher.copy_job_inputs | copied | name=%s", source.name)
+
+
+def _utc_timestamp() -> str:
+    """
+    UTC time with microseconds so two submits in one second stay ordered.
+
+    :return: timestamp as str. Example: "2026-10-04T18:40:00.000000Z"
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _require_submit_request(request: SubmitRequest) -> None:
+    """
+    Reject a value that is not a submit request.
+
+    :param request: submit arguments as SubmitRequest. Example: SubmitRequest("Write a brief.", "brief.md exists")
+    :return: None. Example: None
+    :raises TypeError: when request is not a SubmitRequest. Example: {}
+    """
+    if not isinstance(request, SubmitRequest):
+        raise TypeError(
+            "request must be SubmitRequest. Example: SubmitRequest('Write a brief.', 'brief.md exists')"
+        )
+
+
+def _require_connection(connection: sqlite3.Connection) -> None:
+    """
+    Reject a value that is not an open sqlite connection.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :return: None. Example: None
+    :raises TypeError: when connection is not a Connection. Example: None
+    """
+    if not isinstance(connection, sqlite3.Connection):
+        raise TypeError("connection must be sqlite3.Connection. Example: the Database connection")
+
+
+def _capacity_reading(
+    capacity: CapacityReader,
+    memory: MemoryReader | None,
+    ollama: HttpReader | None,
+    pressure: PressureReader | None,
+    ollama_host: str | None,
+) -> dict:
+    """
+    Call CapacityReader.read with the stored ports.
+
+    :param capacity: memory and Ollama reader as CapacityReader. Example: CapacityReader()
+    :param memory: returns (total_gb, free_gb) as MemoryReader | None. Example: lambda: (64.0, 40.2)
+    :param ollama: HTTP reader as HttpReader | None. Example: lambda path: (200, {"models": []})
+    :param pressure: pressure reader as PressureReader | None. Example: lambda: "normal"
+    :param ollama_host: base URL as str | None. Example: "http://127.0.0.1:11434"
+    :return: capacity body as dict. Example: {"ollama": "up", "recommended": "qwen-14b"}
+    :raises RuntimeError: when a port was not stored. Example: memory=None
+    :raises TypeError: when read does not return a dict. Example: None
+    """
+    if memory is None or ollama is None or pressure is None or ollama_host is None:
+        raise RuntimeError(
+            "submit needs memory, ollama, pressure, and ollama_host. Example: CapacityReader.read ports"
+        )
+    reading = capacity.read(memory, ollama, pressure, ollama_host)
+    if not isinstance(reading, dict):
+        raise TypeError(
+            "CapacityReader.read must return a dict. Example: {'ollama': 'up', 'recommended': 'qwen-14b'}"
+        )
+    return reading
+
+
+def _capacity_rejection(reading: dict, model: str | None) -> dict | None:
+    """
+    Reject a down daemon, or a none recommendation when the caller omitted the model.
+
+    :param reading: capacity body as dict. Example: {"ollama": "down", "recommended": "none"}
+    :param model: requested model as str | None. Example: None
+    :return: rejected body or None as dict | None. Example: {"status": "rejected", "reason": "ollama_down", "task_id": None}
+    """
+    if reading.get("ollama") == OLLAMA_DOWN:
+        logger.info("dispatcher.submit | branch=ollama_down")
+        return _rejected(_REASON_OLLAMA_DOWN)
+    if reading.get("recommended") == RECOMMENDATION_NONE and model is None:
+        logger.info("dispatcher.submit | branch=model_unavailable")
+        return _rejected(_REASON_MODEL_UNAVAILABLE)
+    return None
+
+
+def _rejected(reason: str) -> dict:
+    """
+    Build a rejection that has no pin.
+
+    :param reason: rejection reason as str. Example: "ollama_down"
+    :return: rejected body as dict. Example: {"status": "rejected", "reason": "ollama_down", "task_id": None}
+    """
+    return {"status": "rejected", "reason": reason, "task_id": None}
+
+
+def _chosen_model(requested: str | None, reading: dict) -> str:
+    """
+    Use the caller's model, or the capacity recommendation when it was omitted.
+
+    :param requested: requested model as str | None. Example: None
+    :param reading: capacity body as dict. Example: {"recommended": "qwen-14b"}
+    :return: model name as str. Example: "qwen-14b"
+    :raises InvalidModel: when the recommendation is missing. Example: {}
+    """
+    if requested is not None:
+        return requested
+    recommended = reading.get("recommended")
+    if not isinstance(recommended, str):
+        raise InvalidModel("recommended model is missing. Example: 'qwen-14b'")
+    logger.info("dispatcher.submit | model omitted; using recommended=%s", recommended)
+    return recommended
+
+
+def _timestamp(clock: Callable[[], str]) -> str:
+    """
+    Read one non-empty timestamp from the clock.
+
+    :param clock: UTC timestamp source as Callable[[], str]. Example: lambda: "2026-10-04T18:40:00Z"
+    :return: timestamp as str. Example: "2026-10-04T18:40:00Z"
+    :raises TypeError: when clock is not callable. Example: None
+    :raises ValueError: when the clock returns a blank value. Example: "  "
+    """
+    if not callable(clock):
+        raise TypeError("clock must be callable. Example: lambda: '2026-10-04T18:40:00Z'")
+    stamp = clock()
+    if not isinstance(stamp, str) or not stamp.strip():
+        raise ValueError("clock must return a non-empty timestamp. Example: '2026-10-04T18:40:00Z'")
+    return stamp
+
+
+def _queued_pin(
+    task_id: str,
+    request: SubmitRequest,
+    priority: int,
+    model: str,
+    grant: AccessGrant,
+    created_at: str,
+) -> TaskPin:
+    """
+    Build the pin inserted with status queued.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param request: submit arguments as SubmitRequest. Example: SubmitRequest("Write a brief.", "brief.md exists")
+    :param priority: queue rank as int. Example: 40
+    :param model: chosen size as str. Example: "qwen-14b"
+    :param grant: grant as AccessGrant. Example: AccessGrant(mode="job")
+    :param created_at: enqueue time as str. Example: "2026-10-04T18:40:00Z"
+    :return: pin as TaskPin. Example: a pin with status "queued"
+    """
+    return TaskPin(
+        task_id=task_id,
+        priority=priority,
+        status=_STATUS_QUEUED,
+        model=model,
+        goal=request.goal,
+        done_when=request.done_when,
+        access=grant,
+        phase=_PHASE_QUEUED,
+        created_at=created_at,
+    )
+
+
+def _queued_body(pin: TaskPin, position: int) -> dict:
+    """
+    Build the snapshot returned before the slot claims the pin.
+
+    :param pin: queued pin as TaskPin. Example: a pin with status "queued"
+    :param position: one-based place as int. Example: 1
+    :return: queued body as dict. Example: {"status": "queued", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", "position": 1}
+    """
+    return {
+        "status": _STATUS_QUEUED,
+        "task_id": pin.task_id,
+        "priority": pin.priority,
+        "model": pin.model,
+        "position": position,
+        "access": _access_body(pin.access),
+    }
+
+
+def _access_body(grant: AccessGrant) -> dict:
+    """
+    Match the stored grant JSON. Empty path lists are omitted.
+
+    :param grant: grant as AccessGrant. Example: AccessGrant(mode="job")
+    :return: access object as dict. Example: {"mode": "job"}
+    """
+    body: dict[str, object] = {"mode": grant.mode}
+    if grant.paths:
+        body["paths"] = list(grant.paths)
+    return body
+
+
+def _log_submit(task_id: str, priority: int, model: str, grant_mode: str) -> None:
+    """
+    Log the queued submit on one INFO line.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param priority: queue rank as int. Example: 40
+    :param model: chosen size as str. Example: "qwen-14b"
+    :param grant_mode: grant mode as str. Example: "paths"
+    :return: None. Example: None
+    """
+    logger.info(
+        "dispatcher.submit | entry | task_id=%s priority=%s model=%s grant=%s",
+        task_id,
+        priority,
+        model,
+        grant_mode,
+    )
