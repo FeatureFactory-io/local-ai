@@ -340,6 +340,23 @@ def test_run_task_with_shell_tool_and_no_numbered_plan_runs_that_command(tmp_pat
     assert [(step.order, step.status) for step in _steps(worker, connection)] == [(1, "completed")]
 
 
+def test_run_task_retries_when_the_recovery_turn_is_a_shell_command(tmp_path: Path) -> None:
+    """A failed command is replaced by the shell call on the recovery turn."""
+    good = "python3 -c \"open('poem.md','w').write('python\\n')\""
+    worker, connection, job_dir = _open_worker(
+        tmp_path,
+        (
+            Completion(tool_calls=(ToolCall("shell", "false"),)),
+            Completion(tool_calls=(ToolCall("shell", good),)),
+        ),
+    )
+
+    outcome = worker.run_task(_TASK_ID)
+
+    assert outcome == "completed"
+    assert (job_dir / "poem.md").read_text(encoding="utf-8") == "python\n"
+
+
 def test_run_task_stops_on_third_identical_failure(tmp_path: Path) -> None:
     """The third identical command returns failed and does not insert another step."""
     script = (

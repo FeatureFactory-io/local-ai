@@ -137,14 +137,16 @@ def test_run_empty_command_does_not_start(tmp_path: Path) -> None:
     assert list(job_dir.iterdir()) == []
 
 
-def test_run_unparsable_command_does_not_start(tmp_path: Path) -> None:
-    """An unmatched quote returns an envelope and does not start a process."""
+def test_run_unparsable_command_is_handed_to_the_shell(tmp_path: Path) -> None:
+    """An unmatched quote is still run by the shell, which reports the syntax error."""
     tool, grant, job_dir = _job_shell(tmp_path)
 
     envelope = tool.run(grant, 'printf "', job_dir)
 
-    assert envelope == ToolEnvelope(success=False, result=None, error="unparsable command")
-    assert list(job_dir.iterdir()) == []
+    assert envelope.success is False
+    assert envelope.error != "unparsable command"
+    assert "syntax error" in (envelope.error or "")
+    assert (job_dir / "shell.log").is_file()
 
 
 def test_run_missing_executable_returns_stderr_without_raising(

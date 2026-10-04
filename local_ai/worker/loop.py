@@ -187,6 +187,8 @@ class Worker:
         _require_adapt_args(task_id, order, model_name, error)
         self._publish_phase(task_id, "recovering")
         new_order = self._insert_replacement(task_id, order, model_name, error)
+        if new_order is None:
+            return
         self._publish_phase(task_id, "acting")
         logger.info("worker.adapt | inserted | task_id=%s step=%s", task_id, new_order)
 
@@ -525,9 +527,11 @@ class Worker:
         if command is None or self.note_identical_failure(task_id, order, command):
             return "failed"
         self.adapt_after_failure(task_id, order, model_name, self._failed_error)
+        if self.failure_reason:
+            return "failed"
         return "adapted"
 
-    def _insert_replacement(self, task_id: str, order: int, model_name: str, error: str) -> int:
+    def _insert_replacement(self, task_id: str, order: int, model_name: str, error: str) -> int | None:
         """
         Ask for one replacement sentence and insert it after the failed step.
 
@@ -535,13 +539,14 @@ class Worker:
         :param order: failed step order as int. Example: 2
         :param model_name: logical size as str. Example: "qwen-24b"
         :param error: tool error as str. Example: "weasyprint: CSS path missing"
-        :return: new order as int. Example: 3
-        :raises ValueError: when the model names no action. Example: Completion()
+        :return: new order, or None when there is nothing to run. Example: 3
         """
         completion = self._llm.complete(self._recovery_prompt(task_id, order, error), model_name)
-        action = _action_sentence(completion)
-        if not action:
-            raise ValueError("replacement action is empty. Example: 'Fix the CSS path'")
+        action = _replacement_action(completion, self)
+        if action is None:
+            self.failure_reason = error.strip() or "empty_plan"
+            logger.info("worker.adapt | no replacement | task_id=%s", task_id)
+            return None
         return self._plan.insert_after(self._connection, task_id, order, action)
 
     def _recovery_prompt(self, task_id: str, order: int, error: str) -> str:
@@ -614,6 +619,22 @@ def _require_adapt_args(task_id: str, order: int, model_name: str, error: str) -
     _require_step_args(task_id, order, model_name)
     if not isinstance(error, str):
         raise TypeError("error must be str. Example: 'weasyprint: CSS path missing'")
+
+
+def _replacement_action(completion: Completion, worker: Worker) -> str | None:
+    """
+    Use the sentence, or the shell command when that is all the model returned.
+
+    :param completion: recovery turn as Completion. Example: Completion(final_answer="Fix the CSS path")
+    :param worker: worker that stores a seed command as Worker. Example: Worker(...)
+    :return: action or None as str | None. Example: "Fix the CSS path"
+    """
+    command = _shell_command(completion)
+    action = _action_sentence(completion)
+    if command:
+        worker._seed_command = command
+        return action or "Run the replacement shell command"
+    return action or None
 
 
 def _action_sentence(completion: Completion) -> str:

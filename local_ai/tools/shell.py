@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 _SHELL_LOG_NAME = "shell.log"
 _ACCESS_DENIED = "access_denied"
 _EMPTY_COMMAND = "empty command"
-_UNPARSABLE_COMMAND = "unparsable command"
 _COMMAND_NOT_FOUND = 127
 
 
@@ -46,6 +45,9 @@ class ShellTool:
         argv = _parse_argv(command)
         if isinstance(argv, ToolEnvelope):
             return argv
+        if argv is None:
+            logger.info("ShellTool.run unparsable_command handed to sh")
+            return _finish(_start_process(command, job_dir), job_dir)
         logger.info(f"Starting ShellTool.run argc={len(argv)} cwd={job_dir}")
         denied = self._denied_envelope(grant, job_dir, argv)
         if denied is not None:
@@ -95,18 +97,20 @@ def _require_run_args(grant: AccessGrant, command: str, job_dir: Path) -> None:
         raise ValueError(f"job_dir must be an existing directory, got {job_dir}")
 
 
-def _parse_argv(command: str) -> tuple[str, ...] | ToolEnvelope:
+def _parse_argv(command: str) -> tuple[str, ...] | ToolEnvelope | None:
     """
     Split a command into tokens without starting a process.
 
+    None means the quotes are not valid for shlex. The caller still runs the text in sh.
+
     :param command: shell command as str. Example: "printf %s hello"
-    :return: tokens or a failure envelope as tuple[str, ...] | ToolEnvelope. Example: ("printf", "%s", "hello")
+    :return: tokens, a failure envelope, or None. Example: ("printf", "%s", "hello")
     """
     try:
         argv = tuple(shlex.split(command))
     except ValueError:
         logger.info("ShellTool.run unparsable_command")
-        return _failed(_UNPARSABLE_COMMAND)
+        return None
     if not argv:
         logger.info("ShellTool.run empty_command")
         return _failed(_EMPTY_COMMAND)
