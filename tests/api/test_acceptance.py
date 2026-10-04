@@ -146,6 +146,84 @@ def test_stdio_client_generates_code_that_runs(tmp_path: Path) -> None:
     _assert_stdout_is_only_jsonrpc(stdout)
 
 
+_SUMMARY_GOAL = "Summarize ch-01.md and ch-02.md into summary.md, one thesis line per chapter."
+_SUMMARY_DONE = "summary.md names ch-01 and ch-02 and repeats each chapter's first line."
+_CHAPTERS = {
+    "ch-01.md": "The river is the argument.\nThe rest of the chapter wanders.\n",
+    "ch-02.md": "The indent is the proof.\nExamples follow the claim.\n",
+}
+_SUMMARIZE = """
+from pathlib import Path
+lines = []
+for path in sorted(Path('.').glob('ch-*.md')):
+    thesis = path.read_text(encoding='utf-8').splitlines()[0]
+    lines.append(path.name + ': ' + thesis)
+Path('summary.md').write_text('\\n'.join(lines) + '\\n', encoding='utf-8')
+""".strip()
+
+
+def test_stdio_client_summarizes_copied_chapters(tmp_path: Path) -> None:
+    """Submit two chapter files. The worker writes a summary that quotes each thesis."""
+    sources = _write_chapters(tmp_path)
+    host, port, server = _start_ollama(_summary_script())
+    process = _start_dispatcher(tmp_path, host, port)
+    stdout: list[str] = []
+    try:
+        _send(process, _initialize())
+        _response(process, 1, stdout)
+        _send(process, _initialized())
+        accepted = _tool(process, 2, "submit", _summary_submit(sources), stdout)
+        pin = _poll_until_terminal(process, str(accepted["task_id"]), stdout)
+    finally:
+        _stop(process)
+        server.shutdown()
+
+    job = tmp_path / "jobs" / str(accepted["task_id"])
+    summary = (job / "summary.md").read_text(encoding="utf-8")
+    assert accepted["status"] == "queued"
+    assert pin["status"] == "completed", pin.get("error")
+    assert pin["goal"] == _SUMMARY_GOAL
+    assert (job / "ch-01.md").is_file()
+    assert (job / "ch-02.md").is_file()
+    assert "ch-01.md: The river is the argument." in summary
+    assert "ch-02.md: The indent is the proof." in summary
+    assert any("summary" in note["text"].lower() for note in pin["reasoning"])
+    _assert_stdout_is_only_jsonrpc(stdout)
+
+
+def _write_chapters(tmp_path: Path) -> list[str]:
+    """Write the two source chapters and return their paths."""
+    folder = tmp_path / "chapters"
+    folder.mkdir()
+    paths: list[str] = []
+    for name, text in _CHAPTERS.items():
+        path = folder / name
+        path.write_text(text, encoding="utf-8")
+        paths.append(str(path))
+    return paths
+
+
+def _summary_script() -> list[dict]:
+    """Plan, then write summary.md from the copied chapter files."""
+    command = "python3 -c " + shlex.quote(_SUMMARIZE)
+    return [
+        _chat("1. Write summary.md from ch-01.md and ch-02.md", thinking="One thesis line per chapter."),
+        _chat("Wrote summary.md", thinking="Writing summary.md from the chapter files.", command=command),
+    ]
+
+
+def _summary_submit(sources: list[str]) -> dict:
+    """The submit a person would send to summarize the two chapters."""
+    return {
+        "goal": _SUMMARY_GOAL,
+        "done_when": _SUMMARY_DONE,
+        "priority": 40,
+        "model": "qwen-14b",
+        "inputs": sources,
+        "access": {"mode": "job"},
+    }
+
+
 def _code_script() -> list[dict]:
     """Plan, write add.py, then run it."""
     write = "python3 -c " + shlex.quote(f"open('add.py','w').write({_ADD_PY!r})")
