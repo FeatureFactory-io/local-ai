@@ -289,9 +289,66 @@ def default_grant(access: dict | None) -> AccessGrant:
     :return: grant as AccessGrant. Example: AccessGrant(mode="job")
     :raises InvalidAccess: when mode is unknown or paths mode has no paths. Example: {"mode": "root"}
     """
-    # None becomes AccessGrant(mode="job").
-    # mode "home" ignores paths. mode "paths" requires a non-empty paths list.
-    # Reject other modes with InvalidAccess.
-    # Log the mode at INFO.
-    raise NotImplementedError
+    logger.info("Starting default_grant omitted=%s", access is None)
+    if access is None:
+        logger.info("Grant omitted; using mode=job")
+        return AccessGrant(mode="job")
+    mode = _require_grant_mode(access)
+    if mode == "paths":
+        return _grant_for_paths(access)
+    # home and job do not store a path list. home is the user home directory.
+    logger.info("Accepted grant mode=%s", mode)
+    return AccessGrant(mode=mode)
+
+
+def _require_grant_mode(access: object) -> str:
+    """
+    Read a known grant mode.
+
+    :param access: raw grant object as object. Example: {"mode": "job"}
+    :return: mode as str. Example: "job"
+    :raises InvalidAccess: when mode is unknown. Example: {"mode": "root"}
+    """
+    if not isinstance(access, dict):
+        logger.info("Rejecting grant branch=type value_type=%s", type(access).__name__)
+        raise InvalidAccess(f"access must be a dict, got {type(access).__name__}")
+    mode = access.get("mode")
+    if mode not in ("job", "paths", "home"):
+        logger.info("Rejecting grant branch=mode mode=%s", mode)
+        raise InvalidAccess(f"unknown grant mode {mode!r}")
+    return str(mode)
+
+
+def _grant_for_paths(access: dict) -> AccessGrant:
+    """
+    Build a paths grant from a non-empty path list.
+
+    :param access: raw grant object as dict. Example: {"mode": "paths", "paths": ["/Users/denispetelin/books/draft"]}
+    :return: grant as AccessGrant. Example: AccessGrant(mode="paths", paths=("/Users/denispetelin/books/draft",))
+    :raises InvalidAccess: when paths is missing or empty. Example: {"mode": "paths"}
+    """
+    raw_paths = access.get("paths")
+    if not isinstance(raw_paths, (list, tuple)) or len(raw_paths) == 0:
+        logger.info("Rejecting grant branch=paths reason=empty")
+        raise InvalidAccess("paths mode requires a non-empty paths list")
+    paths = _string_paths(raw_paths)
+    logger.info("Accepted grant mode=paths count=%s", len(paths))
+    return AccessGrant(mode="paths", paths=paths)
+
+
+def _string_paths(raw_paths: list | tuple) -> tuple[str, ...]:
+    """
+    Copy path strings. The path text stays out of the log.
+
+    :param raw_paths: path list as list | tuple. Example: ["/Users/denispetelin/books/draft"]
+    :return: paths as tuple[str, ...]. Example: ("/Users/denispetelin/books/draft",)
+    :raises InvalidAccess: when an entry is not a non-empty string. Example: [""]
+    """
+    checked: list[str] = []
+    for item in raw_paths:
+        if not isinstance(item, str) or item == "":
+            logger.info("Rejecting grant branch=paths reason=entry")
+            raise InvalidAccess("paths mode requires non-empty string paths")
+        checked.append(item)
+    return tuple(checked)
 
