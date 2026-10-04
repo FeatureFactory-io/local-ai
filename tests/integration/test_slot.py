@@ -123,6 +123,30 @@ def test_second_pin_stays_queued_while_the_first_run_is_in_flight(tmp_path: Path
     _join_slot(slot)
 
 
+def test_three_queued_jobs_execute_the_last_highest_priority_first(tmp_path: Path) -> None:
+    """Priority 10, submitted last, runs before priority 50 and priority 80."""
+    service, connection, slot = _open(
+        tmp_path,
+        script=_COMPLETE_TURN * 3,
+        slot_clock=_advancing_clock(),
+    )
+    late = _submit(service, connection, "Write the late brief.", priority=80)
+    middle = _submit(service, connection, "Write the middle brief.", priority=50)
+    urgent = _submit(service, connection, "Write the urgent brief.", priority=10)
+    ids = [str(late["task_id"]), str(middle["task_id"]), str(urgent["task_id"])]
+
+    assert [pin["status"] for pin in (late, middle, urgent)] == ["queued", "queued", "queued"]
+    assert urgent["position"] == 1
+    slot.kick()
+    _join_slot(slot)
+
+    order = _started_order(connection, ids)
+    stamps = _serial_stamps(connection, order)
+    assert order == [ids[2], ids[1], ids[0]]
+    assert stamps == sorted(set(stamps))
+    assert all(service.read_pin(task_id, connection)["status"] == "completed" for task_id in ids)
+
+
 def test_run_finishes_a_completed_pin_and_kicks_the_next(tmp_path: Path) -> None:
     """A completed run_task writes the clock time, then the next pin runs."""
     service, connection, slot = _open(
@@ -242,17 +266,23 @@ def _open(
     return service, connection, slot
 
 
-def _submit(service: DispatcherService, connection: sqlite3.Connection, goal: str) -> dict:
+def _submit(
+    service: DispatcherService,
+    connection: sqlite3.Connection,
+    goal: str,
+    priority: int = 40,
+) -> dict:
     """
     Queue one pin. The caller kicks after this snapshot.
 
     :param service: dispatcher as DispatcherService. Example: the service from _open
     :param connection: open connection as sqlite3.Connection. Example: the Database connection
     :param goal: worker goal as str. Example: "Write a brief."
+    :param priority: queue rank as int. Example: 40
     :return: queued snapshot as dict. Example: {"status": "queued", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"}
     """
     return service.submit(
-        SubmitRequest(goal, "brief.md exists", priority=40, model="qwen-14b"),
+        SubmitRequest(goal, "brief.md exists", priority=priority, model="qwen-14b"),
         connection,
     )
 
@@ -311,6 +341,81 @@ def _join_slot(slot: Slot, timeout: float = _JOIN_TIMEOUT_S) -> None:
         if slot._thread is None or slot._thread is thread:
             return
     raise AssertionError("slot thread did not finish")
+
+
+def _advancing_clock() -> Callable[[], str]:
+    """
+    Return a clock whose timestamps increase by one second on each call.
+
+    :return: clock as Callable[[], str]. Example: a clock that yields "2026-10-04T18:42:00Z"
+    """
+    second = 0
+
+    def clock() -> str:
+        """
+        Read the next timestamp.
+
+        :return: timestamp as str. Example: "2026-10-04T18:42:00Z"
+        """
+        nonlocal second
+        stamp = f"2026-10-04T18:42:{second:02d}Z"
+        second += 1
+        return stamp
+
+    return clock
+
+
+def _started_order(connection: sqlite3.Connection, task_ids: list[str]) -> list[str]:
+    """
+    Order pin ids by the time the slot claimed them.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_ids: pin ids as list[str]. Example: ["late", "middle", "urgent"]
+    :return: ids earliest start first as list[str]. Example: ["urgent", "middle", "late"]
+    """
+    return sorted(task_ids, key=lambda task_id: _started_at(connection, task_id))
+
+
+def _serial_stamps(connection: sqlite3.Connection, task_ids: list[str]) -> list[str]:
+    """
+    Start then finish time for each pin, in the given order.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_ids: pin ids in execution order as list[str]. Example: ["urgent", "middle", "late"]
+    :return: timestamps as list[str]. Example: ["2026-10-04T18:42:00Z", "2026-10-04T18:42:01Z"]
+    """
+    stamps: list[str] = []
+    for task_id in task_ids:
+        stamps.append(_started_at(connection, task_id))
+        stamps.append(_required_finished_at(connection, task_id))
+    return stamps
+
+
+def _started_at(connection: sqlite3.Connection, task_id: str) -> str:
+    """
+    Read the pin's started_at column.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: timestamp as str. Example: "2026-10-04T18:42:00Z"
+    """
+    row = connection.execute("SELECT started_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row is not None
+    assert isinstance(row["started_at"], str)
+    return row["started_at"]
+
+
+def _required_finished_at(connection: sqlite3.Connection, task_id: str) -> str:
+    """
+    Read a pin's finished_at. A missing time is a failure.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: timestamp as str. Example: "2026-10-04T18:42:01Z"
+    """
+    finished_at = _finished_at(connection, task_id)
+    assert isinstance(finished_at, str)
+    return finished_at
 
 
 def _finished_at(connection: sqlite3.Connection, task_id: str) -> str | None:
