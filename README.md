@@ -50,7 +50,7 @@ A rejected call is still a normal MCP result. Check `status`. `rejected` with `r
 | `LOCAL_AI_MODEL_24B` | tag from `ollama list` | Ollama name for `qwen-24b` |
 | `LOCAL_AI_HTTP_PORT` | unset for stdio | Set only for the ChatGPT HTTP transport |
 
-The logical names `qwen-8b`, `qwen-14b`, and `qwen-24b` are what `submit` stores. The `LOCAL_AI_MODEL_*` variables are the tags Ollama actually runs. The values in [.cursor/mcp.json](.cursor/mcp.json) are `qwen2.5:7b`, `qwen2.5:14b`, and `qwen2.5:32b`. Change them to the tags `ollama list` prints before you submit.
+The logical names `qwen-8b`, `qwen-14b`, and `qwen-24b` are what `submit` stores. The `LOCAL_AI_MODEL_*` variables are the tags Ollama actually runs. This machine has `qwen3:14b` and `qwen3:32b`, and no separate 8B tag, so [.cursor/mcp.json](.cursor/mcp.json) maps both `qwen-8b` and `qwen-14b` to `qwen3:14b`, and `qwen-24b` to `qwen3:32b`. Change them if `ollama list` changes.
 
 Logs go to `logs/app.log` and to stderr. Stdout stays empty so the MCP handshake is not corrupted. Job files and shell transcripts are under `data/jobs/<task_id>/`.
 
@@ -81,9 +81,9 @@ Claude speaks the same stdio server. Add this block to `~/Library/Application Su
     "OLLAMA_HOST": "http://127.0.0.1:11434",
     "LOCAL_AI_DB": "/Users/denispetelin/local-ai/data/local-ai.sqlite",
     "LOCAL_AI_JOBS": "/Users/denispetelin/local-ai/data/jobs",
-    "LOCAL_AI_MODEL_8B": "qwen2.5:7b",
-    "LOCAL_AI_MODEL_14B": "qwen2.5:14b",
-    "LOCAL_AI_MODEL_24B": "qwen2.5:32b"
+    "LOCAL_AI_MODEL_8B": "qwen3:14b",
+    "LOCAL_AI_MODEL_14B": "qwen3:14b",
+    "LOCAL_AI_MODEL_24B": "qwen3:32b"
   }
 }
 ```
@@ -97,9 +97,9 @@ LOCAL_AI_HTTP_PORT=8765 \
 OLLAMA_HOST=http://127.0.0.1:11434 \
 LOCAL_AI_DB=/Users/denispetelin/local-ai/data/local-ai.sqlite \
 LOCAL_AI_JOBS=/Users/denispetelin/local-ai/data/jobs \
-LOCAL_AI_MODEL_8B=qwen2.5:7b \
-LOCAL_AI_MODEL_14B=qwen2.5:14b \
-LOCAL_AI_MODEL_24B=qwen2.5:32b \
+LOCAL_AI_MODEL_8B=qwen3:14b \
+LOCAL_AI_MODEL_14B=qwen3:14b \
+LOCAL_AI_MODEL_24B=qwen3:32b \
 .venv/bin/python -m local_ai
 ```
 

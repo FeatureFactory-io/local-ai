@@ -7,9 +7,9 @@
         "OLLAMA_HOST": "http://127.0.0.1:11434",
         "LOCAL_AI_DB": "/Users/denispetelin/local-ai/data/local-ai.sqlite",
         "LOCAL_AI_JOBS": "/Users/denispetelin/local-ai/data/jobs",
-        "LOCAL_AI_MODEL_8B": "qwen2.5:7b",
-        "LOCAL_AI_MODEL_14B": "qwen2.5:14b",
-        "LOCAL_AI_MODEL_24B": "qwen2.5:32b"
+        "LOCAL_AI_MODEL_8B": "qwen3:14b",
+        "LOCAL_AI_MODEL_14B": "qwen3:14b",
+        "LOCAL_AI_MODEL_24B": "qwen3:32b"
       }
     }
   }
