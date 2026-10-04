@@ -21,6 +21,8 @@ from local_ai.capacity.reader import (
 from local_ai.contracts import (
     AccessGrant,
     InvalidModel,
+    PlanStep,
+    ReasoningNote,
     SubmitRequest,
     TaskPin,
     default_grant,
@@ -41,6 +43,8 @@ _STATUS_RUNNING = "running"
 _PHASE_QUEUED = "queued"
 _REASON_OLLAMA_DOWN = "ollama_down"
 _REASON_MODEL_UNAVAILABLE = "model_unavailable"
+_STATUS_REJECTED = "rejected"
+_REASON_NOT_FOUND = "not_found"
 
 
 class DispatcherService:
@@ -166,14 +170,21 @@ class DispatcherService:
         """
         Return one pin, including live reasoning and steps.
 
+        A missing id returns status rejected and reason not_found. Steps are loaded only when the pin exists.
+
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
-        :return: pin body as dict. Example: {"status": "running", "phase": "acting", "steps": []}
+        :return: pin body or rejection as dict. Example: {"status": "running", "phase": "acting", "steps": []}
+        :raises TypeError: when connection is not a Connection. Example: None
+        :raises ValueError: when task_id is blank. Example: "  "
         """
-        # Blackboard.get_pin. None returns status rejected, reason not_found.
-        # PlanStore.list_steps. Include goal, access, current_plan, reasoning, artifacts, and error.
-        # Log task_id and status at INFO.
-        raise NotImplementedError
+        pin = self._blackboard.get_pin(connection, task_id)
+        steps: tuple[PlanStep, ...] = ()
+        if pin is not None:
+            steps = self._plan.list_steps(connection, task_id)
+        body = _read_body(task_id, pin, steps)
+        _log_read(task_id, str(body["status"]))
+        return body
 
     def reprioritize(self, task_id: str, priority: int, connection: sqlite3.Connection) -> dict:
         """
@@ -534,6 +545,91 @@ def _access_body(grant: AccessGrant) -> dict:
     if grant.paths:
         body["paths"] = list(grant.paths)
     return body
+
+
+def _read_body(task_id: str, pin: TaskPin | None, steps: tuple[PlanStep, ...]) -> dict:
+    """
+    Build the read response. A missing pin is a not_found rejection.
+
+    :param task_id: requested pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param pin: loaded pin as TaskPin | None. Example: None
+    :param steps: ordered steps as tuple[PlanStep, ...]. Example: ()
+    :return: pin body or rejection as dict. Example: {"status": "rejected", "reason": "not_found", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"}
+    """
+    if pin is None:
+        return _rejected_task(task_id, _REASON_NOT_FOUND)
+    return _present_pin(pin, steps)
+
+
+def _rejected_task(task_id: str, reason: str) -> dict:
+    """
+    Build a rejection that names the pin.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param reason: rejection reason as str. Example: "not_found"
+    :return: rejected body as dict. Example: {"status": "rejected", "reason": "not_found", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"}
+    """
+    return {"status": _STATUS_REJECTED, "reason": reason, "task_id": task_id}
+
+
+def _present_pin(pin: TaskPin, steps: tuple[PlanStep, ...]) -> dict:
+    """
+    Map a pin and its steps onto the read contract keys.
+
+    :param pin: loaded pin as TaskPin. Example: a pin with status "running"
+    :param steps: ordered steps as tuple[PlanStep, ...]. Example: ()
+    :return: pin body as dict. Example: {"status": "running", "phase": "acting", "steps": []}
+    """
+    return {
+        "status": pin.status,
+        "task_id": pin.task_id,
+        "priority": pin.priority,
+        "model": pin.model,
+        "phase": pin.phase,
+        "goal": pin.goal,
+        "access": _access_body(pin.access),
+        "current_plan": pin.current_plan,
+        "steps": [_step_body(step) for step in steps],
+        "reasoning": [_note_body(note) for note in pin.reasoning],
+        "artifacts": list(pin.artifacts),
+        "error": pin.error,
+    }
+
+
+def _step_body(step: PlanStep) -> dict:
+    """
+    Map one step onto the read contract keys.
+
+    :param step: one step as PlanStep. Example: PlanStep("7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", 1, "List chapter files", "completed")
+    :return: step object as dict. Example: {"order": 1, "action": "List chapter files", "status": "completed", "llm_synthesis": ""}
+    """
+    return {
+        "order": step.order,
+        "action": step.action,
+        "status": step.status,
+        "llm_synthesis": step.llm_synthesis,
+    }
+
+
+def _note_body(note: ReasoningNote) -> dict:
+    """
+    Map one note onto at, step, and text.
+
+    :param note: one note as ReasoningNote. Example: ReasoningNote("2026-10-04T18:40:01Z", 2, "Reading ch-04.md.")
+    :return: note object as dict. Example: {"at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md."}
+    """
+    return {"at": note.at, "step": note.step, "text": note.text}
+
+
+def _log_read(task_id: str, status: str) -> None:
+    """
+    Log the read outcome on one INFO line.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param status: returned status as str. Example: "running"
+    :return: None. Example: None
+    """
+    logger.info("dispatcher.read | entry | task_id=%s status=%s", task_id, status)
 
 
 def _log_submit(task_id: str, priority: int, model: str, grant_mode: str) -> None:
