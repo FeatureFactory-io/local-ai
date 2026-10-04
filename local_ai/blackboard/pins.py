@@ -100,12 +100,13 @@ class Blackboard:
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param note: note to append as ReasoningNote | None. Example: ReasoningNote("2026-10-04T18:40:01Z", 2, "Reading ch-04.md.")
         :return: None. Example: None
+        :raises TypeError: when connection is not a Connection. Example: None
+        :raises ValueError: when task_id is blank or the pin is missing. Example: "missing-id"
         """
-        # If note is None or its text is empty, return without writing.
-        # Load the current reasoning JSON. If the new note cannot be stored, keep the previous text.
-        # If the stored text would pass REASONING_CAP, drop the oldest notes and keep a truncation marker.
-        # Log blackboard.append with task_id at INFO. Do not log the note body.
-        raise NotImplementedError
+        _require_connection(connection)
+        _require_task_id(task_id)
+        logger.info("blackboard.append | entry | task_id=%s", task_id)
+        _append_parsed_note(connection, task_id, _incoming_note(note))
 
     def set_phase(self, connection: sqlite3.Connection, task_id: str, phase: str, current_plan: str) -> None:
         """
@@ -493,3 +494,91 @@ def _string_list(value: object) -> bool:
     :return: True when every entry is a string. Example: True
     """
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _append_parsed_note(
+    connection: sqlite3.Connection,
+    task_id: str,
+    parsed: dict[str, object] | None,
+) -> None:
+    """
+    Store one parsed note. A column that cannot be parsed is left unchanged.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param parsed: note object or None as dict | None. Example: {"at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md."}
+    :return: None. Example: None
+    :raises ValueError: when the pin does not exist. Example: "missing-id"
+    """
+    if parsed is None:
+        return
+    previous = _reasoning_text(connection, task_id)
+    if previous is None:
+        raise ValueError(
+            "pin not found task_id="
+            f"{task_id}. Example: '7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f'"
+        )
+    try:
+        notes = _stored_note_payloads(previous)
+    except ValueError:
+        logger.info("blackboard.append kept previous task_id=%s", task_id)
+        return
+    notes.append(parsed)
+    _write_reasoning(connection, task_id, json.dumps(notes))
+
+
+def _incoming_note(note: ReasoningNote | None) -> dict[str, object] | None:
+    """
+    Parse one note into at, step, and text. A bad note is None.
+
+    :param note: note to append as ReasoningNote | None. Example: ReasoningNote("2026-10-04T18:40:01Z", 2, "Reading ch-04.md.")
+    :return: note object or None as dict | None. Example: {"at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md."}
+    """
+    if not isinstance(note, ReasoningNote):
+        return None
+    if not isinstance(note.at, str) or not note.at.strip():
+        return None
+    if isinstance(note.step, bool) or not isinstance(note.step, int):
+        return None
+    if not isinstance(note.text, str) or not note.text.strip():
+        return None
+    return {"at": note.at, "step": note.step, "text": note.text}
+
+
+def _stored_note_payloads(text: str) -> list[dict[str, object]]:
+    """
+    Parse stored reasoning into note objects.
+
+    :param text: reasoning column as str. Example: "[]"
+    :return: note objects as list. Example: []
+    :raises ValueError: when text is not an array of notes. Example: "not-json"
+    """
+    return [_note_payload(note) for note in _load_notes(text)]
+
+
+def _reasoning_text(connection: sqlite3.Connection, task_id: str) -> str | None:
+    """
+    Read the reasoning column, or None when the pin is missing.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: reasoning text or None as str | None. Example: "[]"
+    """
+    row = connection.execute("SELECT reasoning FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    return str(row["reasoning"])
+
+
+def _write_reasoning(connection: sqlite3.Connection, task_id: str, text: str) -> None:
+    """
+    Replace the reasoning column and commit.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param text: reasoning JSON as str. Example: "[]"
+    :return: None. Example: None
+    """
+    connection.execute("UPDATE tasks SET reasoning = ? WHERE id = ?", (text, task_id))
+    connection.commit()
+

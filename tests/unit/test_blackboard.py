@@ -139,6 +139,48 @@ def test_get_pin_with_malformed_reasoning_raises(tmp_path: Path) -> None:
         board.get_pin(connection, _TASK_ID)
 
 
+def test_append_reasoning_adds_notes_newest_last(tmp_path: Path) -> None:
+    """Each note is stored as JSON, newest last."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+    first = ReasoningNote("2026-10-04T18:40:01Z", 2, "Reading ch-04.md.")
+    second = ReasoningNote("2026-10-04T18:40:02Z", 2, "The claim is in the last section.")
+
+    board.append_reasoning(connection, _TASK_ID, first)
+    board.append_reasoning(connection, _TASK_ID, second)
+
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.reasoning == (first, second)
+
+
+def test_append_reasoning_with_empty_text_keeps_previous(tmp_path: Path) -> None:
+    """None and blank text do not replace the stored array."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+    kept = ReasoningNote("2026-10-04T18:40:01Z", 2, "Reading ch-04.md.")
+    board.append_reasoning(connection, _TASK_ID, kept)
+    previous = _task_row(connection, _TASK_ID)["reasoning"]
+
+    board.append_reasoning(connection, _TASK_ID, None)
+    board.append_reasoning(connection, _TASK_ID, ReasoningNote("2026-10-04T18:40:02Z", 2, "  "))
+
+    assert _task_row(connection, _TASK_ID)["reasoning"] == previous
+
+
+def test_append_reasoning_with_unknown_id_raises(tmp_path: Path) -> None:
+    """A missing pin is not created by an append."""
+    board, connection = _open_board(tmp_path)
+
+    with pytest.raises(ValueError, match="task_id"):
+        board.append_reasoning(
+            connection,
+            _TASK_ID,
+            ReasoningNote("2026-10-04T18:40:01Z", 2, "Reading ch-04.md."),
+        )
+    assert connection.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 0
+
+
 def test_list_queued_orders_priority_then_created_at(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
