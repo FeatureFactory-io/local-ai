@@ -1,7 +1,12 @@
 """SQLite connection and schema_version 1. Blackboard and PlanStore share this object."""
 
+import logging
 import sqlite3
+import threading
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA_SQL = """
@@ -55,20 +60,61 @@ class Database:
         """
         # Store path. Do not open the file until connect.
         self._path = path
+        self._connection: sqlite3.Connection | None = None
+        self._lock: threading.Lock | None = None
 
     def connect(self) -> sqlite3.Connection:
         """
         Open the single connection.
 
         :return: connection as sqlite3.Connection. Example: a connection with row_factory Row
+        :raises TypeError: when path is not a Path. Example: "data/local-ai.sqlite"
         """
-        # Create the parent directory.
-        # sqlite3.connect(check_same_thread=False) because the slot thread and the MCP thread share it.
-        # Set row_factory to sqlite3.Row.
-        # Execute PRAGMA foreign_keys=ON and PRAGMA journal_mode=WAL.
-        # Store the connection and a threading.Lock that every later call must take.
-        # Log the path at INFO.
-        raise NotImplementedError
+        self._validate_path()
+        if self._connection is not None:
+            logger.info("Database.connect reused path=%s", self._path)
+            return self._connection
+        self._prepare_parent_directory()
+        connection = self._open_connection()
+        self._connection = connection
+        self._lock = threading.Lock()
+        logger.info("Database.connect path=%s", self._path)
+        return connection
+
+    def _validate_path(self) -> None:
+        """
+        Reject a path that is not a Path.
+
+        :return: None. Example: None
+        :raises TypeError: when path is not a Path. Example: "data/local-ai.sqlite"
+        """
+        if not isinstance(self._path, Path):
+            raise TypeError(f"path must be Path, got {type(self._path).__name__}")
+
+    def _prepare_parent_directory(self) -> None:
+        """
+        Create the parent directory for the sqlite file.
+
+        :return: None. Example: None
+        """
+        parent = self._path.parent
+        logger.info("Database.connect creating parent=%s", parent)
+        parent.mkdir(parents=True, exist_ok=True)
+
+    def _open_connection(self) -> sqlite3.Connection:
+        """
+        Open sqlite for shared threads, with Row rows, foreign keys, and WAL.
+
+        :return: connection as sqlite3.Connection. Example: a connection with row_factory Row
+        """
+        # The slot thread and the MCP thread share this connection.
+        connection = sqlite3.connect(self._path, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        journal_row = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+        journal_mode = journal_row[0] if journal_row is not None else ""
+        logger.info("Database.connect journal_mode=%s", journal_mode)
+        return connection
 
     def migrate(self) -> int:
         """
