@@ -1,13 +1,17 @@
 """Plan H sequences across the dispatcher, the slot, and the shell."""
 
+import logging
+import shlex
 import sqlite3
 import time
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
+
 from local_ai.blackboard.pins import Blackboard
 from local_ai.capacity.reader import CapacityReader
-from local_ai.contracts import Completion, SubmitRequest, ToolCall
+from local_ai.contracts import AccessGrant, Completion, SubmitRequest, ToolCall, ToolEnvelope
 from local_ai.db.database import Database
 from local_ai.dispatcher.queue import queue_position
 from local_ai.dispatcher.service import DispatcherService
@@ -83,6 +87,26 @@ def test_reprioritize_moves_the_archive_ahead_of_the_pdf(tmp_path: Path) -> None
     assert service.read_pin(glossary_id, connection)["priority"] == 80
     assert _task_row(connection, str(running["task_id"])) == running_before
     _join_slot(slot, timeout=8.0)
+
+
+def test_home_grant_reads_under_the_given_home_and_job_grant_creates_nothing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Example 4: home may read under the GrantChecker home. Job denies an outside path before a process starts."""
+    caplog.set_level(logging.INFO)
+    job_dir, outside, denied = _run_outside_the_job(tmp_path)
+
+    assert denied == ToolEnvelope(success=False, result=None, error="access_denied")
+    assert not outside.exists()
+    assert list(job_dir.iterdir()) == []
+    assert _logged(caplog, "ShellTool.run access_denied")
+    assert not _logged_prefix(caplog, "ShellTool.run exit_code=")
+
+    grant, allowed = _run_under_home(tmp_path)
+
+    assert Path(grant.paths[0]).resolve() == tmp_path.resolve()
+    assert allowed == ToolEnvelope(success=True, result="draft-pdf", error="")
 
 
 def _open(
@@ -262,3 +286,61 @@ def _task_row(connection: sqlite3.Connection, task_id: str) -> dict[str, object]
     row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     assert row is not None
     return {key: row[key] for key in row.keys()}
+
+
+def _run_outside_the_job(tmp_path: Path) -> tuple[Path, Path, ToolEnvelope]:
+    """
+    Ask a job grant to create a file outside the job directory.
+
+    :param tmp_path: pytest directory, also the home passed to GrantChecker, as Path. Example: Path("/tmp/pytest/test0")
+    :return: job directory, outside path, and envelope as tuple. Example: (Path("/tmp/job"), Path("/tmp/escaped.txt"), ToolEnvelope(...))
+    """
+    job_dir = tmp_path / "job"
+    outside = tmp_path / "escaped.txt"
+    job_dir.mkdir()
+    checker = GrantChecker()
+    grant = checker.resolve("job", (), job_dir, tmp_path)
+    envelope = ShellTool(checker).run(grant, f"touch {shlex.quote(str(outside))}", job_dir)
+    return job_dir, outside, envelope
+
+
+def _run_under_home(tmp_path: Path) -> tuple[AccessGrant, ToolEnvelope]:
+    """
+    Read a file that sits under the home directory passed to GrantChecker.
+
+    :param tmp_path: home directory as Path. Example: Path("/tmp/pytest/test0")
+    :return: resolved grant and envelope as tuple. Example: (AccessGrant(mode="home", paths=("/tmp/pytest/test0",)), ToolEnvelope(...))
+    """
+    job_dir = tmp_path / "home-job"
+    draft = tmp_path / "drafts" / "recent.pdf"
+    job_dir.mkdir()
+    draft.parent.mkdir()
+    draft.write_text("draft-pdf", encoding="utf-8")
+    checker = GrantChecker()
+    grant = checker.resolve("home", (), job_dir, tmp_path)
+    envelope = ShellTool(checker).run(grant, f"cat {shlex.quote(str(draft))}", job_dir)
+    return grant, envelope
+
+
+def _logged(caplog: pytest.LogCaptureFixture, message: str) -> bool:
+    """
+    True when one INFO record equals message.
+
+    :param caplog: captured logs as pytest.LogCaptureFixture. Example: the test's caplog
+    :param message: exact message as str. Example: "ShellTool.run access_denied"
+    :return: whether the line was logged as bool. Example: True
+    """
+    return any(record.levelno == logging.INFO and record.message == message for record in caplog.records)
+
+
+def _logged_prefix(caplog: pytest.LogCaptureFixture, prefix: str) -> bool:
+    """
+    True when one INFO record starts with prefix.
+
+    :param caplog: captured logs as pytest.LogCaptureFixture. Example: the test's caplog
+    :param prefix: message prefix as str. Example: "ShellTool.run exit_code="
+    :return: whether a process exit was logged as bool. Example: False
+    """
+    return any(
+        record.levelno == logging.INFO and record.message.startswith(prefix) for record in caplog.records
+    )
