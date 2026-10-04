@@ -1,0 +1,38 @@
+{
+  "turns": [
+    {
+      "content": "1. Run the check",
+      "thinking": "",
+      "final_answer": "",
+      "tool_calls": []
+    },
+    {
+      "content": "",
+      "thinking": "Running the check.",
+      "final_answer": "",
+      "tool_calls": [
+        {
+          "name": "shell",
+          "command": "python3 -c \"import sys; sys.stderr.write('boom'); raise SystemExit(4)\""
+        }
+      ]
+    },
+    {
+      "content": "",
+      "thinking": "",
+      "final_answer": "Write the marker file",
+      "tool_calls": []
+    },
+    {
+      "content": "",
+      "thinking": "Writing the marker.",
+      "final_answer": "Wrote marker.txt",
+      "tool_calls": [
+        {
+          "name": "shell",
+          "command": "python3 -c \"open('marker.txt','w').write('marker')\""
+        }
+      ]
+    }
+  ]
+}

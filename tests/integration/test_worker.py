@@ -342,6 +342,22 @@ def test_run_task_stops_on_third_identical_failure(tmp_path: Path) -> None:
     assert [step.status for step in _steps(worker, connection)] == ["failed", "failed", "failed"]
 
 
+def test_run_task_recovery_keeps_failed_step_and_completes_the_replacement(tmp_path: Path) -> None:
+    """A non-zero shell stays failed. The inserted step writes the marker and completes."""
+    worker, connection, job_dir = _open_worker(tmp_path, _script("prf-recovery"))
+
+    outcome = worker.run_task(_TASK_ID)
+
+    assert outcome == "completed"
+    steps = _steps(worker, connection)
+    assert [(step.order, step.action, step.status) for step in steps] == [
+        (1, "Run the check", "failed"),
+        (2, "Write the marker file", "completed"),
+    ]
+    assert steps[0].error == "boom"
+    assert (job_dir / "marker.txt").read_text(encoding="utf-8") == "marker"
+
+
 def _open_worker(
     tmp_path: Path,
     script: tuple[Completion, ...],
