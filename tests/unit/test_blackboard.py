@@ -181,6 +181,83 @@ def test_append_reasoning_with_unknown_id_raises(tmp_path: Path) -> None:
     assert connection.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 0
 
 
+def test_requeue_running_returns_pins_to_queued(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Running pins go back to queued. Completed steps and finished pins stay."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(
+        connection,
+        _pin(
+            task_id="run-early",
+            status="running",
+            phase="acting",
+            started_at="2026-10-04T18:40:02Z",
+            created_at="2026-10-04T18:40:00Z",
+        ),
+    )
+    board.insert_pin(
+        connection,
+        _pin(
+            task_id="run-late",
+            status="running",
+            phase="acting",
+            started_at="2026-10-04T18:42:00Z",
+            created_at="2026-10-04T18:41:00Z",
+        ),
+    )
+    board.insert_pin(connection, _pin(task_id="still-queued", priority=80))
+    board.insert_pin(
+        connection,
+        _pin(
+            task_id="already-done",
+            status="completed",
+            phase="completed",
+            started_at="2026-10-04T18:30:00Z",
+            final_status="completed",
+        ),
+    )
+    connection.execute(
+        "INSERT INTO plan_steps (task_id, step_order, action, status) VALUES (?, ?, ?, ?)",
+        ("run-early", 1, "List chapter files", "completed"),
+    )
+    connection.commit()
+    caplog.set_level(logging.INFO, logger="local_ai.blackboard.pins")
+
+    assert board.requeue_running(connection) == ("run-early", "run-late")
+
+    early = board.get_pin(connection, "run-early")
+    late = board.get_pin(connection, "run-late")
+    waiting = board.get_pin(connection, "still-queued")
+    done = board.get_pin(connection, "already-done")
+    assert early is not None and late is not None and waiting is not None and done is not None
+    assert early.status == "queued" and early.phase == "queued" and early.started_at is None
+    assert late.status == "queued" and late.started_at is None
+    assert waiting.status == "queued" and waiting.priority == 80
+    assert done.status == "completed" and done.started_at == "2026-10-04T18:30:00Z"
+    step = connection.execute(
+        "SELECT status FROM plan_steps WHERE task_id = ? AND step_order = ?",
+        ("run-early", 1),
+    ).fetchone()
+    assert step["status"] == "completed"
+    assert any(record.levelno == logging.INFO and "task_id=run-early" in record.message for record in caplog.records)
+    assert any(record.levelno == logging.INFO and "task_id=run-late" in record.message for record in caplog.records)
+
+
+def test_requeue_running_with_none_running_returns_empty(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A queue with no running pin is unchanged."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+    caplog.set_level(logging.INFO, logger="local_ai.blackboard.pins")
+
+    assert board.requeue_running(connection) == ()
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.status == "queued"
+    assert any(record.levelno == logging.INFO and "count=0" in record.message for record in caplog.records)
+
+
 def test_claim_moves_a_queued_pin_to_running(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """The first claim sets running and started_at. Phase stays as it was."""
     board, connection = _open_board(tmp_path)

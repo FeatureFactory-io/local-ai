@@ -207,11 +207,14 @@ class Blackboard:
 
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :return: requeued ids as tuple[str, ...]. Example: ("7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f",)
+        :raises TypeError: when connection is not a Connection. Example: None
         """
-        # Select ids where status is running. Set those rows to queued, phase queued, started_at NULL.
-        # Do not touch plan_steps. Completed steps stay completed.
-        # Log each task_id at INFO.
-        raise NotImplementedError
+        _require_connection(connection)
+        task_ids = _running_ids(connection)
+        if task_ids:
+            _requeue_rows(connection)
+        _log_requeued(task_ids)
+        return task_ids
 
     def list_queued(self, connection: sqlite3.Connection) -> tuple[TaskPin, ...]:
         """
@@ -254,6 +257,48 @@ def _require_pin(pin: TaskPin) -> None:
     _require_task_id(pin.task_id)
     if not isinstance(pin.access, AccessGrant):
         raise TypeError("pin.access must be AccessGrant. Example: AccessGrant('job')")
+
+
+def _running_ids(connection: sqlite3.Connection) -> tuple[str, ...]:
+    """
+    Ids of running pins in created_at order.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :return: ids as tuple[str, ...]. Example: ("7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f",)
+    """
+    rows = connection.execute(
+        "SELECT id FROM tasks WHERE status = ? ORDER BY created_at ASC",
+        (_RUNNING,),
+    ).fetchall()
+    return tuple(str(row["id"]) for row in rows)
+
+
+def _requeue_rows(connection: sqlite3.Connection) -> None:
+    """
+    Set running rows back to queued and clear started_at. Plan steps are not updated.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :return: None. Example: None
+    """
+    connection.execute(
+        "UPDATE tasks SET status = ?, phase = ?, started_at = NULL WHERE status = ?",
+        (_QUEUED, _QUEUED, _RUNNING),
+    )
+    connection.commit()
+
+
+def _log_requeued(task_ids: tuple[str, ...]) -> None:
+    """
+    Log each requeued id, or a zero count when none were running.
+
+    :param task_ids: requeued ids as tuple[str, ...]. Example: ()
+    :return: None. Example: None
+    """
+    if not task_ids:
+        logger.info("blackboard.requeue_running | count=0")
+        return
+    for task_id in task_ids:
+        logger.info("blackboard.requeue_running | task_id=%s", task_id)
 
 
 def _claim_queued(connection: sqlite3.Connection, task_id: str, started_at: str) -> bool:
