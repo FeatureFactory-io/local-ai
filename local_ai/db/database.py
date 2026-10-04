@@ -8,6 +8,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_SCHEMA_VERSION = 1
+
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -121,12 +123,81 @@ class Database:
         Apply schema version 1. A second call returns the same version.
 
         :return: schema version as int. Example: 1
+        :raises RuntimeError: when connect has not run. Example: migrate() before connect()
         """
-        # Take the connection lock.
-        # If schema_meta already has a row, return that version and do not rewrite tables.
-        # Otherwise execute SCHEMA_SQL and insert schema_version 1.
-        # Commit. Log the version at INFO.
-        raise NotImplementedError
+        connection = self._require_connection()
+        with self._require_lock():
+            return self._migrate_locked(connection)
+
+    def _require_connection(self) -> sqlite3.Connection:
+        """
+        Return the connection opened by connect.
+
+        :return: connection as sqlite3.Connection. Example: the connection from connect()
+        :raises RuntimeError: when connect has not run. Example: migrate() before connect()
+        """
+        if self._connection is None:
+            raise RuntimeError("Database.connect must run before migrate")
+        return self._connection
+
+    def _require_lock(self) -> threading.Lock:
+        """
+        Return the lock stored by connect.
+
+        :return: lock as threading.Lock. Example: the lock from connect()
+        :raises RuntimeError: when connect has not stored a lock. Example: migrate() before connect()
+        """
+        if self._lock is None:
+            raise RuntimeError("Database.connect must store a lock before migrate")
+        return self._lock
+
+    def _migrate_locked(self, connection: sqlite3.Connection) -> int:
+        """
+        Apply version 1 or return the version already stored.
+
+        :param connection: open connection as sqlite3.Connection. Example: the connection from connect()
+        :return: schema version as int. Example: 1
+        """
+        existing = self._existing_schema_version(connection)
+        if existing is not None:
+            logger.info("Database.migrate version=%s", existing)
+            return existing
+        self._apply_schema_version_one(connection)
+        logger.info("Database.migrate version=%s", _SCHEMA_VERSION)
+        return _SCHEMA_VERSION
+
+    def _existing_schema_version(self, connection: sqlite3.Connection) -> int | None:
+        """
+        Read schema_meta when it already has a row.
+
+        :param connection: open connection as sqlite3.Connection. Example: the connection from connect()
+        :return: stored version as int or None. Example: 1
+        """
+        found = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
+        ).fetchone()
+        if found is None:
+            logger.info("Database.migrate schema_meta absent")
+            return None
+        row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
+        if row is None:
+            logger.info("Database.migrate schema_meta empty")
+            return None
+        return int(row["version"])
+
+    def _apply_schema_version_one(self, connection: sqlite3.Connection) -> None:
+        """
+        Execute SCHEMA_SQL and insert schema version 1.
+
+        :param connection: open connection as sqlite3.Connection. Example: the connection from connect()
+        :return: None. Example: None
+        """
+        connection.executescript(SCHEMA_SQL)
+        connection.execute(
+            "INSERT INTO schema_meta (version) VALUES (?)",
+            (_SCHEMA_VERSION,),
+        )
+        connection.commit()
 
     @property
     def path(self) -> Path:
