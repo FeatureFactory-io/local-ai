@@ -1,9 +1,15 @@
 """Durable steps. Worker advances them. DispatcherService reads them for the pin response."""
 
+import logging
 import sqlite3
 
 from local_ai.contracts import InvalidStepTransition, PlanStep, StepDraft
 from local_ai.db.database import Database
+
+logger = logging.getLogger(__name__)
+
+_STATUS_PENDING = "pending"
+_MIN_STEP_ORDER = 1
 
 
 class PlanStore:
@@ -37,10 +43,13 @@ class PlanStore:
         :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param steps: proposed steps as tuple[StepDraft, ...]. Example: (StepDraft(1, "List chapter files"),)
         :return: None. Example: None
+        :raises TypeError: when steps is not a tuple of StepDraft. Example: ["List chapter files"]
+        :raises ValueError: when orders repeat or an action is empty. Example: (StepDraft(1, "List"), StepDraft(1, "Again"))
+        :raises sqlite3.IntegrityError: when the parent pin is missing. Example: task_id "missing-task"
         """
-        # Insert each draft as status pending. Orders must be unique for the task.
-        # Log task_id and the count at INFO.
-        raise NotImplementedError
+        self._validate_insert_steps(connection, task_id, steps)
+        self._write_pending_steps(connection, task_id, steps)
+        logger.info("PlanStore.insert_steps task_id=%s count=%s", task_id, len(steps))
 
     def list_steps(self, connection: sqlite3.Connection, task_id: str) -> tuple[PlanStep, ...]:
         """
@@ -171,6 +180,150 @@ class PlanStore:
         for step in steps:
             if not isinstance(step, PlanStep):
                 raise TypeError(f"steps must contain PlanStep, got {type(step).__name__}")
+
+    def _validate_insert_steps(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        steps: tuple[StepDraft, ...],
+    ) -> None:
+        """
+        Reject drafts the plan_steps table cannot store.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param steps: proposed steps as tuple[StepDraft, ...]. Example: (StepDraft(1, "List chapter files"),)
+        :return: None. Example: None
+        :raises TypeError: when steps is not a tuple of StepDraft. Example: ["List chapter files"]
+        :raises ValueError: when orders repeat or an action is empty. Example: (StepDraft(1, "List"), StepDraft(1, "Again"))
+        """
+        self._require_connection(connection)
+        self._require_task_id(task_id)
+        self._require_step_drafts(steps)
+        self._require_unique_new_orders(connection, task_id, steps)
+
+    def _require_connection(self, connection: sqlite3.Connection) -> None:
+        """
+        Reject an object that is not an open sqlite connection.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :return: None. Example: None
+        :raises TypeError: when connection is not sqlite3.Connection. Example: None
+        """
+        if not isinstance(connection, sqlite3.Connection):
+            raise TypeError(f"connection must be sqlite3.Connection, got {type(connection).__name__}")
+
+    def _require_task_id(self, task_id: str) -> None:
+        """
+        Reject a blank or non-string pin id.
+
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :return: None. Example: None
+        :raises ValueError: when task_id is blank. Example: ""
+        :raises TypeError: when task_id is not a str. Example: None
+        """
+        if not isinstance(task_id, str):
+            raise TypeError(f"task_id must be str, got {type(task_id).__name__}")
+        if not task_id.strip():
+            raise ValueError(f"task_id must be a non-empty str, got {task_id!r}")
+
+    def _require_step_drafts(self, steps: tuple[StepDraft, ...]) -> None:
+        """
+        Reject anything other than a tuple of StepDraft with a usable order and action.
+
+        :param steps: proposed steps as tuple[StepDraft, ...]. Example: (StepDraft(1, "List chapter files"),)
+        :return: None. Example: None
+        :raises TypeError: when steps is not a tuple of StepDraft. Example: ["List chapter files"]
+        :raises ValueError: when an order is below 1 or an action is empty. Example: StepDraft(0, "List")
+        """
+        if not isinstance(steps, tuple):
+            raise TypeError(f"steps must be a tuple, got {type(steps).__name__}")
+        for step in steps:
+            self._require_step_draft(step)
+
+    def _require_step_draft(self, step: StepDraft) -> None:
+        """
+        Reject one draft the table cannot store.
+
+        :param step: one draft as StepDraft. Example: StepDraft(1, "List chapter files")
+        :return: None. Example: None
+        :raises TypeError: when step is not a StepDraft. Example: "List chapter files"
+        :raises ValueError: when order is below 1 or action is empty. Example: StepDraft(0, "List")
+        """
+        if not isinstance(step, StepDraft):
+            raise TypeError(f"steps must contain StepDraft, got {type(step).__name__}")
+        if isinstance(step.order, bool) or not isinstance(step.order, int) or step.order < _MIN_STEP_ORDER:
+            raise ValueError(f"step order must be an int >= {_MIN_STEP_ORDER}, got {step.order!r}")
+        if not isinstance(step.action, str) or not step.action.strip():
+            raise ValueError(f"step action must be a non-empty str, got {step.action!r}")
+
+    def _require_unique_new_orders(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        steps: tuple[StepDraft, ...],
+    ) -> None:
+        """
+        Reject orders that repeat in the batch or already exist for the task.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param steps: proposed steps as tuple[StepDraft, ...]. Example: (StepDraft(1, "List chapter files"),)
+        :return: None. Example: None
+        :raises ValueError: when an order is repeated. Example: (StepDraft(1, "List"), StepDraft(1, "Again"))
+        """
+        orders = [step.order for step in steps]
+        if len(orders) != len(set(orders)):
+            raise ValueError(f"step orders must be unique, got {orders}")
+        self._require_orders_absent(connection, task_id, orders)
+
+    def _require_orders_absent(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        orders: list[int],
+    ) -> None:
+        """
+        Reject an order this task already stored.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param orders: candidate orders as list[int]. Example: [1, 2]
+        :return: None. Example: None
+        :raises ValueError: when an order is already stored. Example: 1
+        """
+        if not orders:
+            return
+        placeholders = ", ".join("?" for _ in orders)
+        row = connection.execute(
+            f"SELECT step_order FROM plan_steps WHERE task_id = ? AND step_order IN ({placeholders})",
+            (task_id, *orders),
+        ).fetchone()
+        if row is not None:
+            raise ValueError(f"step order {int(row['step_order'])} already exists for task_id={task_id}")
+
+    def _write_pending_steps(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        steps: tuple[StepDraft, ...],
+    ) -> None:
+        """
+        Insert each draft as status pending.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param steps: proposed steps as tuple[StepDraft, ...]. Example: (StepDraft(1, "List chapter files"),)
+        :return: None. Example: None
+        :raises sqlite3.IntegrityError: when the parent pin is missing. Example: task_id "missing-task"
+        """
+        connection.executemany(
+            """
+            INSERT INTO plan_steps (task_id, step_order, action, status)
+            VALUES (?, ?, ?, ?)
+            """,
+            [(task_id, step.order, step.action, _STATUS_PENDING) for step in steps],
+        )
 
     def _render_step_line(self, step: PlanStep) -> str:
         """
