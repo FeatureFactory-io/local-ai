@@ -193,6 +193,61 @@ def test_mark_running_rejects_a_closed_or_running_step(tmp_path: Path, status: s
     assert _step_rows(connection, _TASK_ID)[0]["status"] == status
 
 
+def test_complete_step_stores_synthesis_and_result(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A running step becomes completed and keeps the handoff text."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(1, "List chapter files"),))
+    store.mark_running(connection, _TASK_ID, 1)
+
+    with caplog.at_level(logging.INFO, logger="local_ai.plan.steps"):
+        store.complete_step(
+            connection,
+            _TASK_ID,
+            1,
+            "Found ch-01.md through ch-12.md",
+            '{"success": true}',
+        )
+
+    row = _step_rows(connection, _TASK_ID)[0]
+    assert row["status"] == "completed"
+    assert row["action"] == "List chapter files"
+    assert row["llm_synthesis"] == "Found ch-01.md through ch-12.md"
+    assert row["result_json"] == '{"success": true}'
+    assert _TASK_ID in caplog.text
+    assert "order=1" in caplog.text
+
+
+@pytest.mark.parametrize("status", ["pending", "waiting_retry", "completed", "failed"])
+def test_complete_step_rejects_a_step_that_is_not_running(tmp_path: Path, status: str) -> None:
+    """Only a running step can be completed. Other statuses stay unchanged."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(1, "List chapter files"),))
+    _set_status(connection, _TASK_ID, 1, status)
+
+    with pytest.raises(InvalidStepTransition):
+        store.complete_step(connection, _TASK_ID, 1, "Found ch-01.md through ch-12.md", '{"success": true}')
+
+    row = _step_rows(connection, _TASK_ID)[0]
+    assert row["status"] == status
+    assert row["llm_synthesis"] == ""
+    assert row["result_json"] == ""
+
+
+def test_complete_step_rejects_a_missing_step(tmp_path: Path) -> None:
+    """A missing order is not running, so it cannot be completed."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(1, "List chapter files"),))
+    store.mark_running(connection, _TASK_ID, 1)
+
+    with pytest.raises(InvalidStepTransition):
+        store.complete_step(connection, _TASK_ID, 9, "Found ch-01.md", '{"success": true}')
+
+    assert _step_rows(connection, _TASK_ID)[0]["status"] == "running"
+
+
 def test_mark_running_rejects_a_missing_step(tmp_path: Path) -> None:
     """A missing order is not a transition."""
     store, connection = _open_store(tmp_path)

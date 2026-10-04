@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 _STATUS_PENDING = "pending"
 _STATUS_RUNNING = "running"
+_STATUS_COMPLETED = "completed"
 _STATUS_WAITING_RETRY = "waiting_retry"
 _MARK_RUNNING_SOURCES = frozenset({_STATUS_PENDING, _STATUS_WAITING_RETRY})
 _MIN_STEP_ORDER = 1
@@ -104,10 +105,14 @@ class PlanStore:
         :param result_json: tool envelope as str. Example: "{\\"success\\": true}"
         :return: None. Example: None
         :raises InvalidStepTransition: when the step is not running. Example: a pending step
+        :raises TypeError: when synthesis or result_json is not a str. Example: None
         """
-        # Set status completed, llm_synthesis, and result_json.
-        # Log task_id and order at INFO.
-        raise NotImplementedError
+        self._require_step_address(connection, task_id, order)
+        self._require_text("synthesis", synthesis)
+        self._require_text("result_json", result_json)
+        self._require_running(connection, task_id, order)
+        self._store_completion(connection, task_id, order, synthesis, result_json)
+        logger.info("PlanStore.complete_step task_id=%s order=%s", task_id, order)
 
     def fail_step(
         self,
@@ -310,6 +315,61 @@ class PlanStore:
         ).fetchone()
         if row is not None:
             raise ValueError(f"step order {int(row['step_order'])} already exists for task_id={task_id}")
+
+    def _require_text(self, name: str, value: str) -> None:
+        """
+        Reject a handoff field that is not a string.
+
+        :param name: field name as str. Example: "synthesis"
+        :param value: field value as str. Example: "Found ch-01.md through ch-12.md"
+        :return: None. Example: None
+        :raises TypeError: when value is not a str. Example: None
+        """
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be str, got {type(value).__name__}")
+
+    def _require_running(self, connection: sqlite3.Connection, task_id: str, order: int) -> None:
+        """
+        Allow complete_step only from running.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 1
+        :return: None. Example: None
+        :raises InvalidStepTransition: when the step is not running. Example: a pending step
+        """
+        status = self._require_step_status(connection, task_id, order)
+        if status != _STATUS_RUNNING:
+            raise InvalidStepTransition(
+                f"cannot complete_step from status={status} task_id={task_id} order={order}"
+            )
+
+    def _store_completion(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        order: int,
+        synthesis: str,
+        result_json: str,
+    ) -> None:
+        """
+        Mark one running step completed and store the handoff.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 1
+        :param synthesis: next-step handoff as str. Example: "Found ch-01.md through ch-12.md"
+        :param result_json: tool envelope as str. Example: "{\\"success\\": true}"
+        :return: None. Example: None
+        """
+        connection.execute(
+            """
+            UPDATE plan_steps
+            SET status = ?, llm_synthesis = ?, result_json = ?
+            WHERE task_id = ? AND step_order = ?
+            """,
+            (_STATUS_COMPLETED, synthesis, result_json, task_id, order),
+        )
 
     def _require_step_address(self, connection: sqlite3.Connection, task_id: str, order: int) -> None:
         """
