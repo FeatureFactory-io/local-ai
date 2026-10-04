@@ -1,8 +1,12 @@
 """Model port. Worker depends on LlmPort. The dispatcher does not."""
 
+import logging
 from collections.abc import Mapping
 
 from local_ai.contracts import Completion, ScriptExhausted
+
+
+logger = logging.getLogger(__name__)
 
 
 class LlmPort:
@@ -43,12 +47,61 @@ class ScriptedLLM(LlmPort):
         :param prompt: assembled prompt as str. Example: "Foundation\\nTask"
         :param model_name: logical size as str. Example: "qwen-8b"
         :return: next completion as Completion. Example: Completion(content="List the files.")
+        :raises ValueError: when prompt is not str. Example: None
         :raises ScriptExhausted: when the script has no turn left. Example: a third call on a two-turn script
         """
-        # If the index is past the script, raise ScriptExhausted.
-        # Otherwise return that turn and advance the index.
-        # Log the index and model_name at INFO. Do not log the prompt body.
-        raise NotImplementedError
+        logger.info(
+            "Starting ScriptedLLM.complete index=%s model_name=%s",
+            self._index,
+            model_name,
+        )
+        self._require_turn_request(prompt, model_name)
+        turn = self._next_scripted_turn(model_name)
+        logger.info(
+            "ScriptedLLM.complete returned index=%s model_name=%s",
+            self._index - 1,
+            model_name,
+        )
+        return turn
+
+    def _require_turn_request(self, prompt: str, model_name: str) -> None:
+        """
+        Reject a turn request that is not text.
+
+        :param prompt: assembled prompt as str. Example: "Foundation\\nTask"
+        :param model_name: logical size as str. Example: "qwen-8b"
+        :return: None. Example: None
+        :raises ValueError: when prompt or model_name is not a string. Example: None
+        """
+        if not isinstance(prompt, str):
+            raise ValueError("prompt must be str. Example: 'Foundation\\nTask'")
+        if not isinstance(model_name, str) or not model_name:
+            raise ValueError("model_name must be a non-empty str. Example: 'qwen-8b'")
+
+    def _next_scripted_turn(self, model_name: str) -> Completion:
+        """
+        Take the turn at the current index, or raise when the script is finished.
+
+        :param model_name: logical size as str. Example: "qwen-8b"
+        :return: next completion as Completion. Example: Completion(content="List the files.")
+        :raises ScriptExhausted: when the index is past the script. Example: index 2 on a two-turn script
+        """
+        if self._index >= len(self._script):
+            logger.info(
+                "ScriptedLLM.complete exhausted index=%s model_name=%s",
+                self._index,
+                model_name,
+            )
+            raise ScriptExhausted(
+                f"script has no turn left at index={self._index} model_name={model_name}"
+            )
+        turn = self._script[self._index]
+        if not isinstance(turn, Completion):
+            raise TypeError(
+                "script turn must be Completion. Example: Completion(content='List the files.')"
+            )
+        self._index += 1
+        return turn
 
 
 class LiteLLMAdapter(LlmPort):
