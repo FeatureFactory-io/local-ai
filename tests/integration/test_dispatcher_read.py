@@ -18,6 +18,7 @@ from tests.support.log_story import assert_log_story
 
 _TASK_ID = "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
 _OTHER_ID = "11111111-2222-4333-8444-555555555555"
+_LATER_ID = "22222222-3333-4444-8555-666666666666"
 _GOAL = "Summarize the book into 2-3 pages, one thesis per chapter."
 _PLAN = (
     "1. List chapter files (completed). "
@@ -226,6 +227,85 @@ def test_reprioritize_with_priority_outside_range_does_not_write(
     assert _priority(connection, _TASK_ID) == 40
 
 
+def test_recover_running_requeues_running_pins_and_keeps_completed_steps(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Running pins return to the queue. A completed step stays completed."""
+    service, connection, blackboard, plan = _open(tmp_path)
+    _seed_running_with_completed_step(connection, blackboard, plan)
+    blackboard.insert_pin(
+        connection,
+        _pin(status="queued", phase="queued", task_id=_OTHER_ID, created_at="2026-10-04T18:39:00Z"),
+    )
+    blackboard.insert_pin(
+        connection,
+        _pin(
+            status="completed",
+            phase="completed",
+            task_id=_LATER_ID,
+            created_at="2026-10-04T18:42:00Z",
+        ),
+    )
+    caplog.set_level(logging.INFO)
+
+    requeued = service.recover_running(connection)
+
+    assert requeued == (_TASK_ID,)
+    assert _status(connection, _TASK_ID) == "queued"
+    assert _started_at(connection, _TASK_ID) is None
+    assert _status(connection, _OTHER_ID) == "queued"
+    assert _status(connection, _LATER_ID) == "completed"
+    steps = plan.list_steps(connection, _TASK_ID)
+    assert [(step.order, step.status) for step in steps] == [(1, "completed"), (2, "pending")]
+    assert_log_story(
+        caplog.records,
+        "dispatcher.recover_running",
+        "requeued",
+        [f"task_id={_TASK_ID}"],
+    )
+
+
+def test_recover_running_with_no_running_pins_returns_empty(tmp_path: Path) -> None:
+    """An idle queue returns no ids."""
+    service, connection, blackboard, _plan = _open(tmp_path)
+    blackboard.insert_pin(connection, _pin(status="queued", phase="queued"))
+
+    assert service.recover_running(connection) == ()
+    assert _status(connection, _TASK_ID) == "queued"
+
+
+def test_recover_running_returns_ids_in_created_at_order(tmp_path: Path) -> None:
+    """Two running pins come back oldest first."""
+    service, connection, blackboard, _plan = _open(tmp_path)
+    blackboard.insert_pin(
+        connection,
+        _pin(status="running", phase="acting", created_at="2026-10-04T18:41:00Z", started_at="2026-10-04T18:41:02Z"),
+    )
+    blackboard.insert_pin(
+        connection,
+        _pin(
+            status="running",
+            phase="acting",
+            task_id=_OTHER_ID,
+            created_at="2026-10-04T18:40:00Z",
+            started_at="2026-10-04T18:40:02Z",
+        ),
+    )
+
+    assert service.recover_running(connection) == (_OTHER_ID, _TASK_ID)
+    assert _status(connection, _TASK_ID) == "queued"
+    assert _status(connection, _OTHER_ID) == "queued"
+
+
+def test_recover_running_with_a_bad_connection_raises(tmp_path: Path) -> None:
+    """A missing connection is rejected before any row is read."""
+    service, _connection, _blackboard, _plan = _open(tmp_path)
+
+    with pytest.raises(TypeError, match="connection"):
+        service.recover_running(None)  # type: ignore[arg-type]
+
+
 def _open(
     tmp_path: Path,
 ) -> tuple[DispatcherService, sqlite3.Connection, Blackboard, PlanStore]:
@@ -286,6 +366,32 @@ def _seed_running_contract(
     plan.mark_running(connection, _TASK_ID, 1)
     plan.complete_step(connection, _TASK_ID, 1, "Found ch-01.md through ch-12.md", "")
     plan.mark_running(connection, _TASK_ID, 2)
+
+
+def _seed_running_with_completed_step(
+    connection: sqlite3.Connection,
+    blackboard: Blackboard,
+    plan: PlanStore,
+) -> None:
+    """
+    Store a running pin whose first step is completed and whose second is pending.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param blackboard: pin store as Blackboard. Example: Blackboard(database)
+    :param plan: step store as PlanStore. Example: PlanStore(database)
+    :return: None. Example: None
+    """
+    blackboard.insert_pin(
+        connection,
+        _pin(status="running", phase="acting", started_at="2026-10-04T18:40:02Z"),
+    )
+    plan.insert_steps(
+        connection,
+        _TASK_ID,
+        (StepDraft(1, "List chapter files"), StepDraft(2, "Write a thesis per chapter")),
+    )
+    plan.mark_running(connection, _TASK_ID, 1)
+    plan.complete_step(connection, _TASK_ID, 1, "Found ch-01.md through ch-12.md", "")
 
 
 def _pin(
@@ -359,6 +465,20 @@ def _priority(connection: sqlite3.Connection, task_id: str) -> int:
     :return: priority as int. Example: 40
     """
     return int(_task_column(connection, task_id, "priority"))
+
+
+def _started_at(connection: sqlite3.Connection, task_id: str) -> str | None:
+    """
+    Read one pin's started_at. NULL stays None.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: dispatch time as str | None. Example: None
+    """
+    value = _task_column(connection, task_id, "started_at")
+    if value is None:
+        return None
+    return str(value)
 
 
 def _status(connection: sqlite3.Connection, task_id: str) -> str:

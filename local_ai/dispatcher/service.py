@@ -233,12 +233,15 @@ class DispatcherService:
         """
         On process start, put running pins back on the queue.
 
+        Completed plan steps stay completed. This method does not update plan steps.
+
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :return: requeued ids as tuple[str, ...]. Example: ()
+        :raises TypeError: when connection is not a Connection. Example: None
         """
-        # Blackboard.requeue_running. Completed plan steps stay completed.
-        # Log each task_id at INFO.
-        raise NotImplementedError
+        task_ids = self._blackboard.requeue_running(connection)
+        _log_recovered(task_ids)
+        return task_ids
 
     def finish(
         self,
@@ -676,6 +679,20 @@ def _apply_queued_priority(
         "priority": priority,
         "position": position,
     }
+
+
+def _log_recovered(task_ids: tuple[str, ...]) -> None:
+    """
+    Log each requeued id. An empty result logs that nothing was running.
+
+    :param task_ids: requeued ids as tuple[str, ...]. Example: ()
+    :return: None. Example: None
+    """
+    if len(task_ids) == 0:
+        logger.info("dispatcher.recover_running | empty")
+        return
+    for task_id in task_ids:
+        logger.info("dispatcher.recover_running | requeued | task_id=%s", task_id)
 
 
 def _log_read(task_id: str, status: str) -> None:
