@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from local_ai.blackboard.pins import Blackboard
-from local_ai.contracts import AccessGrant, TaskPin
+from local_ai.contracts import AccessGrant, ReasoningNote, TaskPin
 from local_ai.db.database import Database
 
 
@@ -89,6 +89,62 @@ def test_insert_pin_with_a_blank_task_id_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="task_id"):
         board.insert_pin(connection, _pin(task_id="  "))
+
+
+def test_get_pin_returns_the_stored_pin(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Access JSON and reasoning notes come back as the same pin."""
+    board, connection = _open_board(tmp_path)
+    pin = _pin(
+        access=AccessGrant("paths", ("/Users/denispetelin/books/draft",)),
+        current_plan="1. List chapter files (running).",
+        reasoning=(ReasoningNote("2026-10-04T18:40:01Z", 2, "Reading ch-04.md."),),
+        artifacts=("/tmp/summary.md",),
+    )
+    board.insert_pin(connection, pin)
+    caplog.set_level(logging.INFO, logger="local_ai.blackboard.pins")
+
+    loaded = board.get_pin(connection, _TASK_ID)
+
+    assert loaded == pin
+    assert any(
+        record.levelno == logging.INFO
+        and f"task_id={_TASK_ID}" in record.message
+        and "status=queued" in record.message
+        for record in caplog.records
+    )
+
+
+def test_get_pin_with_unknown_id_returns_none(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A missing id is None. The caller decides not_found."""
+    board, connection = _open_board(tmp_path)
+    caplog.set_level(logging.INFO, logger="local_ai.blackboard.pins")
+
+    assert board.get_pin(connection, _TASK_ID) is None
+    assert any(
+        record.levelno == logging.INFO
+        and f"task_id={_TASK_ID}" in record.message
+        and "status=missing" in record.message
+        for record in caplog.records
+    )
+
+
+def test_get_pin_with_malformed_reasoning_raises(tmp_path: Path) -> None:
+    """Stored reasoning that is not a JSON array fails instead of inventing notes."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+    connection.execute("UPDATE tasks SET reasoning = ? WHERE id = ?", ("not-json", _TASK_ID))
+    connection.commit()
+
+    with pytest.raises(ValueError, match="reasoning"):
+        board.get_pin(connection, _TASK_ID)
+
+
+def test_get_pin_with_a_blank_task_id_raises(tmp_path: Path) -> None:
+    """A blank id is rejected before the select."""
+    board, connection = _open_board(tmp_path)
+
+    with pytest.raises(ValueError, match="task_id"):
+        board.get_pin(connection, " ")
 
 
 def test_insert_pin_with_a_non_connection_raises(tmp_path: Path) -> None:

@@ -66,11 +66,18 @@ class Blackboard:
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :return: pin or None as TaskPin | None. Example: None
+        :raises TypeError: when connection is not a Connection. Example: None
+        :raises ValueError: when task_id is blank or stored JSON cannot be parsed. Example: "not-json"
         """
-        # Select the tasks row. Parse access_json and reasoning JSON into the dataclass.
-        # A missing id returns None. The caller decides not_found.
-        # Log the task_id and status at INFO.
-        raise NotImplementedError
+        _require_connection(connection)
+        _require_task_id(task_id)
+        row = _select_task(connection, task_id)
+        if row is None:
+            logger.info("blackboard.get | task_id=%s | status=missing", task_id)
+            return None
+        pin = _pin_from_row(row)
+        logger.info("blackboard.get | task_id=%s | status=%s", pin.task_id, pin.status)
+        return pin
 
     def append_reasoning(
         self,
@@ -306,3 +313,172 @@ def _dump_artifacts(artifacts: tuple[str, ...]) -> str:
     if any(not isinstance(path, str) for path in artifacts):
         raise TypeError("artifacts must be a tuple of strings. Example: ('/tmp/summary.md',)")
     return json.dumps(list(artifacts))
+
+
+def _select_task(connection: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
+    """
+    Load one tasks row by id.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: row or None as sqlite3.Row | None. Example: None
+    """
+    return connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+
+def _pin_from_row(row: sqlite3.Row) -> TaskPin:
+    """
+    Map a tasks row onto a pin. Access and reasoning are JSON on the row.
+
+    :param row: tasks row as sqlite3.Row. Example: the row for id 7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f
+    :return: pin as TaskPin. Example: a pin with status "queued"
+    :raises ValueError: when access, reasoning, or artifacts JSON cannot be parsed. Example: "not-json"
+    """
+    return TaskPin(
+        task_id=str(row["id"]),
+        priority=int(row["priority"]),
+        status=str(row["status"]),
+        model=str(row["model"]),
+        goal=str(row["goal"]),
+        done_when=str(row["done_when"]),
+        access=_load_access(str(row["access_json"])),
+        phase=str(row["phase"]),
+        current_plan=str(row["current_plan"]),
+        reasoning=_load_notes(str(row["reasoning"])),
+        artifacts=_load_artifacts(str(row["artifacts_json"])),
+        error=str(row["error"]),
+        created_at=str(row["created_at"]),
+        started_at=_optional_text(row["started_at"]),
+        finished_at=_optional_text(row["finished_at"]),
+        final_status=str(row["final_status"]),
+    )
+
+
+def _optional_text(value: object) -> str | None:
+    """
+    Keep NULL as None and other values as text.
+
+    :param value: column value as object. Example: None
+    :return: text or None as str | None. Example: None
+    """
+    if value is None:
+        return None
+    return str(value)
+
+
+def _load_access(text: str) -> AccessGrant:
+    """
+    Parse access_json into a grant.
+
+    :param text: JSON object as str. Example: '{"mode": "job"}'
+    :return: grant as AccessGrant. Example: AccessGrant("job")
+    :raises ValueError: when text is not a grant object. Example: "not-json"
+    """
+    payload = _load_object(text, "access_json")
+    mode = payload.get("mode")
+    paths = payload.get("paths", [])
+    if not isinstance(mode, str) or not _string_list(paths):
+        raise ValueError('access_json must be a grant object. Example: {"mode": "job"}')
+    return AccessGrant(mode, tuple(paths))
+
+
+def _load_notes(text: str) -> tuple[ReasoningNote, ...]:
+    """
+    Parse the reasoning column into notes, newest last.
+
+    :param text: JSON array as str. Example: "[]"
+    :return: notes as tuple[ReasoningNote, ...]. Example: ()
+    :raises ValueError: when text is not an array of notes. Example: "not-json"
+    """
+    return tuple(_note_from_payload(item) for item in _load_array(text, "reasoning"))
+
+
+def _note_from_payload(item: object) -> ReasoningNote:
+    """
+    Parse one stored note object.
+
+    :param item: JSON value as object. Example: {"at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md."}
+    :return: note as ReasoningNote. Example: ReasoningNote("2026-10-04T18:40:01Z", 2, "Reading ch-04.md.")
+    :raises ValueError: when item is not a note object. Example: "Reading ch-04.md."
+    """
+    if not isinstance(item, dict):
+        raise ValueError(
+            'reasoning note must be an object. Example: {"at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md."}'
+        )
+    at = item.get("at")
+    step = item.get("step")
+    text = item.get("text")
+    if not isinstance(at, str) or isinstance(step, bool) or not isinstance(step, int) or not isinstance(text, str):
+        raise ValueError(
+            'reasoning note must have at, step, and text. Example: {"at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md."}'
+        )
+    return ReasoningNote(at, step, text)
+
+
+def _load_artifacts(text: str) -> tuple[str, ...]:
+    """
+    Parse artifacts_json into paths.
+
+    :param text: JSON array as str. Example: "[]"
+    :return: paths as tuple[str, ...]. Example: ()
+    :raises ValueError: when text is not an array of strings. Example: "not-json"
+    """
+    payload = _load_array(text, "artifacts_json")
+    if not _string_list(payload):
+        raise ValueError('artifacts_json must be an array of strings. Example: ["/tmp/summary.md"]')
+    return tuple(payload)
+
+
+def _load_object(text: str, column: str) -> dict[str, object]:
+    """
+    Parse a JSON object column.
+
+    :param text: JSON text as str. Example: '{"mode": "job"}'
+    :param column: column name as str. Example: "access_json"
+    :return: object as dict. Example: {"mode": "job"}
+    :raises ValueError: when text is not a JSON object. Example: "not-json"
+    """
+    payload = _load_json(text, column)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{column} must be a JSON object. Example: " + '{"mode": "job"}')
+    return payload
+
+
+def _load_array(text: str, column: str) -> list[object]:
+    """
+    Parse a JSON array column.
+
+    :param text: JSON text as str. Example: "[]"
+    :param column: column name as str. Example: "reasoning"
+    :return: array as list. Example: []
+    :raises ValueError: when text is not a JSON array. Example: "not-json"
+    """
+    payload = _load_json(text, column)
+    if not isinstance(payload, list):
+        raise ValueError(f"{column} must be a JSON array. Example: []")
+    return payload
+
+
+def _load_json(text: str, column: str) -> object:
+    """
+    Parse JSON or raise a column-specific error.
+
+    :param text: JSON text as str. Example: "[]"
+    :param column: column name as str. Example: "reasoning"
+    :return: parsed value as object. Example: []
+    :raises ValueError: when text is not JSON. Example: "not-json"
+    """
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{column} is not JSON. Example: []") from exc
+
+
+def _string_list(value: object) -> bool:
+    """
+    Tell whether a value is a list of strings.
+
+    :param value: candidate as object. Example: ["/tmp/summary.md"]
+    :return: True when every entry is a string. Example: True
+    """
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
