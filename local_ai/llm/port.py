@@ -159,10 +159,9 @@ class LiteLLMAdapter(LlmPort):
         :raises KeyError: when the matching LOCAL_AI_MODEL_* variable is missing. Example: "LOCAL_AI_MODEL_14B"
         """
         tag = resolve_model_tag(model_name, self._env)
-        # The tag is the Ollama model name. complete_fn applies any provider prefix.
         logger.info("LiteLLMAdapter.complete calling model_name=%s", model_name)
         return self._complete_fn(
-            model=tag,
+            model=_ollama_chat_model(tag),
             messages=[{"role": "user", "content": prompt}],
             tools=[_shell_tool_schema()],
             api_base=self._ollama_host,
@@ -194,6 +193,23 @@ def _require_completion_request(
         raise ValueError("ollama_host must be a non-empty str. Example: 'http://127.0.0.1:11434'")
     if not callable(complete_fn):
         raise TypeError("complete_fn must be callable. Example: litellm.completion")
+
+
+def _ollama_chat_model(tag: str) -> str:
+    """
+    Prefix an Ollama tag so LiteLLM selects the chat provider.
+
+    A bare tag such as qwen3:14b is rejected with "LLM Provider NOT provided".
+
+    :param tag: Ollama tag as str. Example: "qwen3:14b"
+    :return: LiteLLM model as str. Example: "ollama_chat/qwen3:14b"
+    :raises ValueError: when tag is empty. Example: ""
+    """
+    if not isinstance(tag, str) or not tag.strip():
+        raise ValueError("tag must be a non-empty str. Example: 'qwen3:14b'")
+    if "/" in tag:
+        return tag
+    return f"ollama_chat/{tag}"
 
 
 def _shell_tool_schema() -> dict[str, object]:

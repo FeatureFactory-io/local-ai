@@ -84,7 +84,7 @@ def test_complete_with_resolved_tag_calls_litellm_with_shell_schema_and_host() -
 
     _adapter(complete_fn, ollama_host="http://127.0.0.1:11435").complete(PROMPT, "qwen-14b")
     assert set(captured) == {"model", "messages", "tools", "api_base"}
-    assert captured["model"] == TAG
+    assert captured["model"] == f"ollama_chat/{TAG}"
     assert captured["messages"] == [{"role": "user", "content": PROMPT}]
     assert captured["api_base"] == "http://127.0.0.1:11435"
     tools = captured["tools"]
