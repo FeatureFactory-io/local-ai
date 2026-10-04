@@ -40,6 +40,11 @@ _PAUSE_TURN = (
         final_answer="Paused",
     ),
 )
+_HOLD_COMMAND = "python3 -c \"open('awake.txt','w').write('1'); import time; time.sleep(1)\""
+_HOLD_TURN = (
+    Completion(content="1. Pause in the job folder"),
+    Completion(tool_calls=(ToolCall("shell", _HOLD_COMMAND),), final_answer="Paused"),
+)
 
 
 def test_kick_with_an_empty_queue_returns_without_a_thread(tmp_path: Path) -> None:
@@ -95,6 +100,24 @@ def test_kick_with_a_live_thread_leaves_both_pins_queued(tmp_path: Path) -> None
     assert service.read_pin(str(second["task_id"]), connection)["status"] == "queued"
     release.set()
     thread.join(timeout=2)
+
+
+def test_second_pin_stays_queued_while_the_first_run_is_in_flight(tmp_path: Path) -> None:
+    """A kick during run_task does not claim the pin submitted behind the running one."""
+    service, connection, slot = _open(tmp_path, script=_HOLD_TURN, slot_clock=lambda: _FINISHED_AT)
+    first = _submit(service, connection, "Write the first brief.")
+    slot.kick()
+    _wait_for_hold(tmp_path, str(first["task_id"]))
+    second = _submit(service, connection, "Write the second brief.")
+
+    slot.kick()
+
+    assert second["status"] == "queued"
+    assert service.read_pin(str(second["task_id"]), connection)["status"] == "queued"
+    assert service.read_pin(str(first["task_id"]), connection)["status"] == "running"
+    assert slot._thread is not None
+    assert slot._thread.is_alive()
+    _join_slot(slot)
 
 
 def test_run_finishes_a_completed_pin_and_kicks_the_next(tmp_path: Path) -> None:
@@ -215,6 +238,24 @@ def _ollama_up(url: str) -> tuple[int, dict]:
     if url.endswith("/api/ps"):
         return 200, {"models": [{"name": "qwen2.5:14b"}]}
     raise AssertionError(url)
+
+
+def _wait_for_hold(tmp_path: Path, task_id: str, timeout: float = _JOIN_TIMEOUT_S) -> None:
+    """
+    Wait until the in-flight shell has created awake.txt and is still sleeping.
+
+    :param tmp_path: pytest directory as Path. Example: Path("/tmp/pytest/test0")
+    :param task_id: running pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param timeout: seconds to wait as float. Example: 5
+    :return: None. Example: None
+    :raises AssertionError: when the marker does not appear. Example: a denied shell
+    """
+    marker = tmp_path / "jobs" / task_id / "awake.txt"
+    deadline = time.monotonic() + timeout
+    while not marker.is_file():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"hold marker missing path={marker}")
+        time.sleep(0.01)
 
 
 def _join_slot(slot: Slot, timeout: float = _JOIN_TIMEOUT_S) -> None:
