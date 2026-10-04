@@ -19,7 +19,7 @@ Reference: Junior Edda artifact **AI Agent Reference Architecture** (playbook 3,
 
 ```text
 Frontier model (Cursor / Claude Desktop / ChatGPT)
-        │  MCP: capacity, submit, read, reprioritize
+        │  MCP: capacity, submit, read, reprioritize, list, cancel, purge
         ▼
 Dispatcher
         │  pins and reads
@@ -71,7 +71,7 @@ plan       → SQLite
 
 ### UI
 
-No product UI. Operators inspect pins with `read` and the SQLite file. A later status page can render the same pins.
+No product UI. Operators list pins with `list`, inspect one pin with `read`, drop a waiting pin with `cancel`, and remove finished pins with `purge`. The SQLite file remains the store. A later status page can render the same pins.
 
 ## 2. Integration & API Design
 
@@ -118,6 +118,13 @@ Both transports call the same dispatcher methods.
 | `submit` | yes | Pin a task and enqueue it |
 | `read` | no | Return one pin, including live reasoning |
 | `reprioritize` | yes | Change priority of a queued pin |
+| `list` | no | Compact rows for the queue, the running pin, and finished pins |
+| `cancel` | yes | Delete one queued pin, its steps, and its job folder |
+| `purge` | yes | Delete finished pins, their steps, and their job folders |
+
+`list`, `cancel`, and `purge` are the operator verbs. Pin statuses stay `queued`, `running`, `completed`, and `failed`. `cancel` does not invent a `cancelled` status: the row is deleted. `purge` deletes only `completed` and `failed` rows. A `running` pin stays, including its job folder. `list` omits reasoning, steps, artifacts, and the access grant; `read` remains the full pin. `position` is set only on a queued row.
+
+A job folder is removed only as the direct child `LOCAL_AI_JOBS/<task_id>`. A symlink at that path is unlinked. Its target is left untouched. A path that is not inside the job root is left untouched, and the response says `job_dir_removed: false`.
 
 Stdout of the stdio server stays empty. Logs go to `logs/app.log` and stderr.
 
@@ -228,7 +235,8 @@ Pytest. Tests live under `tests/unit/`, `tests/integration/`, and `tests/api/`.
 | Recovery | A failed shell marks the step `failed`, the scripted model revises the plan, and a later step completes. |
 | Blackboard retain | A malformed reasoning chunk leaves the previous pin text in place. |
 | Failure is visible | When the worker stops with an error, `read` returns `status: failed` and `error`. |
-| Contracts | `capacity`, `submit`, `read`, and `reprioritize` match the JSON examples in this file. |
+| Contracts | `capacity`, `submit`, `read`, `reprioritize`, `list`, `cancel`, and `purge` match the JSON examples in this file. |
+| Job control | `list` orders running, then the queue, then finished pins. `cancel` removes only a queued pin. `purge` removes only finished pins and leaves a running pin. |
 
 The integration suite uses a real SQLite file and a real shell in a temporary directory. Only the LLM is scripted.
 
@@ -257,6 +265,11 @@ Switching size happens when a new task starts, because that is when the dispatch
 | Process crash while `running` | On startup the dispatcher sets that pin back to `queued` and clears `started_at`, leaving completed steps completed. |
 | Model returns no tool call and no final answer | The loop asks once for a final answer. If that is empty, the pin becomes `failed`. |
 | `reprioritize` on a running or finished pin | Response `status: rejected`, pin unchanged. |
+| `list` with an unknown status | Response `status: rejected`, `reason: bad_status`. No rows are read into the response. |
+| `cancel` on a running or finished pin | Response `status: rejected`, `reason: not_queued`. Pin, steps, and job folder stay. |
+| `purge` on a queued or running pin | Response `status: rejected`, `reason: not_terminal`. Pin and job folder stay. |
+| `purge` with `status` of `queued`, `running`, or `all` | Response `status: rejected`, `reason: bad_status`. Nothing is deleted. |
+| Job path is a symlink | The symlink is unlinked. The target outside the job root stays. |
 
 Tool errors stay inside the tool envelope. They do not raise out of the agent loop.
 
@@ -280,6 +293,9 @@ Not yet decided. The SQLite `schema_version` is the rollback boundary for data. 
 dispatcher.submit | entry | task_id=… priority=40 model=qwen-14b grant=paths
 worker.step | acting | task_id=… step=2 tool=shell
 dispatcher.finish | exit | task_id=… status=completed artifacts=2
+dispatcher.list | ok | filter=all count=2
+dispatcher.cancel | cancelled | task_id=… job_dir_removed=true
+dispatcher.purge | ok | count=1
 ```
 
 The same `task_id` is the correlation id on every line for that job. Reasoning text is on the pin. Log lines carry step order and status, not the full shell transcript. Shell transcripts live in `data/jobs/<task_id>/shell.log`.
@@ -592,6 +608,137 @@ Rejected when the pin is already `running`, `completed`, or `failed`:
 }
 ```
 
+#### `list`
+
+Request. `status` may be omitted, `all`, `queued`, `running`, `completed`, or `failed`. Omitted and `all` return every pin.
+
+```json
+{ "status": "all" }
+```
+
+Response. Running pins come first, then queued pins in queue order, then finished pins newest `finished_at` first. `position` is an integer only for a queued pin. Other rows use `null`.
+
+```json
+{
+  "status": "ok",
+  "count": 2,
+  "jobs": [
+    {
+      "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f",
+      "status": "running",
+      "priority": 40,
+      "model": "qwen-14b",
+      "phase": "acting",
+      "goal": "Summarize the book into 2-3 pages, one thesis per chapter.",
+      "error": "",
+      "created_at": "2026-10-04T18:40:00Z",
+      "started_at": "2026-10-04T18:40:02Z",
+      "finished_at": null,
+      "position": null
+    },
+    {
+      "task_id": "11111111-2222-4333-8444-555555555555",
+      "status": "queued",
+      "priority": 30,
+      "model": "qwen-24b",
+      "phase": "queued",
+      "goal": "Combine chapter markdown into book.md.",
+      "error": "",
+      "created_at": "2026-10-04T18:41:00Z",
+      "started_at": null,
+      "finished_at": null,
+      "position": 1
+    }
+  ]
+}
+```
+
+An unknown status:
+
+```json
+{
+  "status": "rejected",
+  "reason": "bad_status",
+  "filter": "done"
+}
+```
+
+#### `cancel`
+
+Request:
+
+```json
+{ "task_id": "11111111-2222-4333-8444-555555555555" }
+```
+
+Response. The pin and its plan steps are gone. `job_dir_removed` is true when the job-root entry was removed.
+
+```json
+{
+  "status": "cancelled",
+  "task_id": "11111111-2222-4333-8444-555555555555",
+  "job_dir_removed": true
+}
+```
+
+Rejected when the pin is `running`, `completed`, or `failed`. A missing pin uses `reason: not_found` and the same three keys.
+
+```json
+{
+  "status": "rejected",
+  "reason": "not_queued",
+  "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+}
+```
+
+#### `purge`
+
+Request. Omit `task_id` to purge every finished pin. Omit `status` to purge both `completed` and `failed`. `status` may be `completed` or `failed`. It may not be `queued`, `running`, or `all`.
+
+```json
+{
+  "task_id": "22222222-3333-4444-8555-666666666666",
+  "status": "completed"
+}
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "count": 1,
+  "purged": [
+    {
+      "task_id": "22222222-3333-4444-8555-666666666666",
+      "prior_status": "completed",
+      "job_dir_removed": true
+    }
+  ]
+}
+```
+
+An empty match is `status: ok`, `count: 0`, `purged: []`. A queued or running `task_id` is rejected and left in place:
+
+```json
+{
+  "status": "rejected",
+  "reason": "not_terminal",
+  "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+}
+```
+
+A finished pin whose status is not the requested `status`:
+
+```json
+{
+  "status": "rejected",
+  "reason": "not_status",
+  "task_id": "22222222-3333-4444-8555-666666666666",
+  "filter": "failed"
+}
+```
+
 ## 19. Class interactions
 
 The product modules are skeletons. Each public method documents its collaborators and raises `NotImplementedError` until a fill slice replaces that method. This section is the wiring those slices follow. A class calls only the collaborators named on its arrow. `DispatcherService` does not call `Worker`. `Worker` does not call `DispatcherService`. `Slot` is the seam between them.
@@ -817,6 +964,44 @@ sequenceDiagram
     LocalAiServer-->>Frontier: reprioritize body
 ```
 
+### List, cancel, and purge
+
+```mermaid
+sequenceDiagram
+    participant Frontier
+    participant LocalAiServer
+    participant DispatcherService
+    participant Blackboard
+
+    Frontier->>LocalAiServer: list(status)
+    LocalAiServer->>DispatcherService: list_jobs(status)
+    DispatcherService->>Blackboard: list_summaries(status)
+    DispatcherService-->>LocalAiServer: compact rows and queue positions
+    LocalAiServer-->>Frontier: list body
+
+    Frontier->>LocalAiServer: cancel(task_id)
+    LocalAiServer->>DispatcherService: cancel(task_id)
+    alt status is queued
+        DispatcherService->>Blackboard: delete_queued(task_id)
+        DispatcherService->>DispatcherService: remove job directory entry
+        DispatcherService-->>LocalAiServer: status cancelled
+    else running, completed, failed, or missing
+        Note over DispatcherService,Blackboard: The row is not deleted
+        DispatcherService-->>LocalAiServer: status rejected
+    end
+
+    Frontier->>LocalAiServer: purge(task_id, status)
+    LocalAiServer->>DispatcherService: purge(task_id, status)
+    alt pin is completed or failed, and the filter matches
+        DispatcherService->>Blackboard: delete_terminal(task_id, statuses)
+        DispatcherService->>DispatcherService: remove each job directory entry
+        DispatcherService-->>LocalAiServer: status ok, purged ids
+    else queued, running, or the filter excludes the pin
+        Note over DispatcherService,Blackboard: The row is not deleted
+        DispatcherService-->>LocalAiServer: status rejected
+    end
+```
+
 ### Finish and the next pin
 
 ```mermaid
@@ -971,6 +1156,14 @@ A job that must search the home directory states the grant:
 
 `read` shows `"access": { "mode": "home" }` for the whole run.
 
+### Example 5 — Seeing the queue and clearing finished work
+
+After example 1 is `running` and example 3's three pins are `queued`, `list` with no status returns the running pin first (`position: null`), then the three queued pins with positions 1, 2, and 3. A later `list` with `"status": "queued"` returns only those three.
+
+`cancel` on the glossary pin deletes that queued row, its steps, and `data/jobs/<glossary-task-id>/`. The running summary and the other queued pins stay. `cancel` on the running pin returns `reason: not_queued`.
+
+When the summary later finishes `completed` and the PDF rebuild finishes `failed`, `purge` with no arguments deletes both pins and both job folders. The pins still `queued` stay. `purge` with the running pin's id, while it is running, returns `reason: not_terminal`.
+
 ## Technology Stack
 
 | Layer | Tool | Version | Verify |
@@ -990,7 +1183,7 @@ Install commands are recorded when the project environment is bootstrapped. This
 | Domain | Covered here | Gap |
 |--------|--------------|-----|
 | Application blocks | Dispatcher, worker, blackboard, plan | Method bodies still raise NotImplementedError. Wiring is section 19 |
-| Integration and API | Four MCP tools with JSON | FastMCP registration is a stub in LocalAiServer.build |
+| Integration and API | Seven MCP tools with JSON | `list`, `cancel`, and `purge` operate on pins. A running pin is not deleted |
 | Data | Pin, steps, grant | SCHEMA_SQL is written. migrate() is still a stub |
 | AI agent | SC-01 subset, CAP table | Worker methods are stubs. Sequences are section 19 |
 | MCP | stdio and localhost HTTP | main() documents both transports and does not bind yet |
@@ -1009,6 +1202,7 @@ Install commands are recorded when the project environment is bootstrapped. This
 | 6 | Model choice | Caller picks 8B, 14B, or 24B from `capacity` | The pin stores the choice. The dispatcher loads it when the slot starts |
 | 7 | OSS | LiteLLM for Ollama. First-party loop and blackboard | Matches the agent reference architecture's model port, without an agent framework |
 | 8 | Progress | Reasoning appended to the pin | `read` shows the live plan and the latest notes |
+| 9 | Operator | `list`, `cancel`, `purge` | See the queue and finished pins, drop a waiting pin, delete terminal pins and their job folders. A running pin stays |
 
 ## Discovered Patterns & Lessons Learned
 

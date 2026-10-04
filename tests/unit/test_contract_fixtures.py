@@ -48,6 +48,16 @@ REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "reprioritize_request.json": ("task_id", "priority"),
     "reprioritize_queued.json": ("status", "task_id", "priority", "position"),
     "reprioritize_rejected.json": ("status", "reason", "task_id"),
+    "list_request.json": ("status",),
+    "list_all.json": ("status", "count", "jobs"),
+    "list_rejected.json": ("status", "reason", "filter"),
+    "cancel_request.json": ("task_id",),
+    "cancel_cancelled.json": ("status", "task_id", "job_dir_removed"),
+    "cancel_rejected.json": ("status", "reason", "task_id"),
+    "purge_request.json": ("task_id", "status"),
+    "purge_ok.json": ("status", "count", "purged"),
+    "purge_not_terminal.json": ("status", "reason", "task_id"),
+    "purge_not_status.json": ("status", "reason", "task_id", "filter"),
 }
 
 

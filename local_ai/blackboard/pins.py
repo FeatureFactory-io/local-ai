@@ -4,7 +4,7 @@ import json
 import logging
 import sqlite3
 
-from local_ai.contracts import REASONING_CAP, AccessGrant, ReasoningNote, TaskPin
+from local_ai.contracts import REASONING_CAP, AccessGrant, JobSummary, ReasoningNote, TaskPin
 from local_ai.db.database import Database
 
 
@@ -26,6 +26,16 @@ _LIST_QUEUED_SQL = """
 SELECT * FROM tasks
 WHERE status = ?
 ORDER BY priority ASC, created_at ASC
+"""
+
+_SUMMARY_COLUMNS = (
+    "id, priority, status, model, phase, goal, error, created_at, started_at, finished_at"
+)
+
+_LIST_SUMMARY_SQL = f"""
+SELECT {_SUMMARY_COLUMNS}
+FROM tasks
+WHERE (? IS NULL OR status = ?)
 """
 
 _INSERT_PIN_SQL = """
@@ -240,6 +250,277 @@ class Blackboard:
         pins = tuple(_pin_from_row(row) for row in rows)
         logger.info("blackboard.list_queued | count=%s", len(pins))
         return pins
+
+    def list_summaries(
+        self,
+        connection: sqlite3.Connection,
+        status: str | None,
+    ) -> tuple[JobSummary, ...]:
+        """
+        Compact rows for one status, or every pin when status is omitted.
+
+        Running rows come first, then queued rows in queue order, then finished rows
+        newest finished_at first. Reasoning and steps are not loaded.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param status: queued, running, completed, failed, or None as str | None. Example: "queued"
+        :return: rows as tuple[JobSummary, ...]. Example: ()
+        :raises TypeError: when connection is not a Connection. Example: None
+        :raises ValueError: when status is not a pin status. Example: "done"
+        """
+        _require_connection(connection)
+        _require_summary_status(status)
+        rows = connection.execute(_LIST_SUMMARY_SQL, (status, status)).fetchall()
+        summaries = _ordered_summaries(tuple(_summary_from_row(row) for row in rows))
+        logger.info("blackboard.list_summaries | status=%s count=%s", status or "all", len(summaries))
+        return summaries
+
+    def delete_queued(self, connection: sqlite3.Connection, task_id: str) -> bool:
+        """
+        Delete one queued pin and its plan steps. A pin that is not queued stays.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :return: whether the queued row was deleted as bool. Example: True
+        :raises TypeError: when connection is not a Connection. Example: None
+        :raises ValueError: when task_id is blank or not one path segment. Example: "../other"
+        """
+        _require_connection(connection)
+        _require_task_id(task_id)
+        removed = _delete_queued_row(connection, task_id)
+        logger.info("blackboard.delete_queued | task_id=%s | removed=%s", task_id, removed)
+        return removed
+
+    def delete_terminal(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str | None,
+        statuses: tuple[str, ...],
+    ) -> tuple[JobSummary, ...]:
+        """
+        Delete completed or failed pins and their plan steps. Queued and running stay.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: one pin id, or None for every match, as str | None. Example: None
+        :param statuses: completed, failed, or both as tuple[str, ...]. Example: ("completed", "failed")
+        :return: deleted rows as tuple[JobSummary, ...]. Example: ()
+        :raises TypeError: when connection or statuses has the wrong type. Example: ["completed"]
+        :raises ValueError: when a status is not terminal, or task_id is not one path segment. Example: "running"
+        """
+        _require_connection(connection)
+        _require_terminal_statuses(statuses)
+        if task_id is not None:
+            _require_task_id(task_id)
+        removed = _delete_terminal_rows(connection, task_id, statuses)
+        logger.info(
+            "blackboard.delete_terminal | task_id=%s | count=%s",
+            task_id or "*",
+            len(removed),
+        )
+        return removed
+
+
+def _require_summary_status(status: str | None) -> None:
+    """
+    Accept a pin status or None for every pin.
+
+    :param status: filter as str | None. Example: "queued"
+    :return: None. Example: None
+    :raises ValueError: when status is not a pin status. Example: "done"
+    """
+    if status is None:
+        return
+    if status not in ("queued", "running", *_TERMINAL_STATUSES):
+        raise ValueError("status must be queued, running, completed, or failed. Example: 'queued'")
+
+
+def _require_terminal_statuses(statuses: tuple[str, ...]) -> None:
+    """
+    Accept a non-empty tuple of completed and failed.
+
+    :param statuses: terminal statuses as tuple[str, ...]. Example: ("completed", "failed")
+    :return: None. Example: None
+    :raises TypeError: when statuses is not a tuple of strings. Example: ["completed"]
+    :raises ValueError: when a status is not terminal or the tuple is empty. Example: ("running",)
+    """
+    if isinstance(statuses, str) or not isinstance(statuses, tuple) or not statuses:
+        raise TypeError("statuses must be a non-empty tuple. Example: ('completed', 'failed')")
+    if any(not isinstance(status, str) or status not in _TERMINAL_STATUSES for status in statuses):
+        raise ValueError("statuses must be completed or failed. Example: ('completed',)")
+
+
+def _ordered_summaries(rows: tuple[JobSummary, ...]) -> tuple[JobSummary, ...]:
+    """
+    Place running first, then the queue, then finished pins newest first.
+
+    :param rows: unsorted rows as tuple[JobSummary, ...]. Example: ()
+    :return: ordered rows as tuple[JobSummary, ...]. Example: ()
+    """
+    running = sorted(
+        (row for row in rows if row.status == "running"),
+        key=lambda row: (row.started_at or "", row.task_id),
+    )
+    queued = sorted(
+        (row for row in rows if row.status == "queued"),
+        key=lambda row: (row.priority, row.created_at, row.task_id),
+    )
+    terminal = [row for row in rows if row.status in _TERMINAL_STATUSES]
+    terminal.sort(key=lambda row: row.task_id)
+    terminal.sort(key=lambda row: row.finished_at or row.created_at, reverse=True)
+    return tuple(running) + tuple(queued) + tuple(terminal)
+
+
+def _summary_from_row(row: sqlite3.Row) -> JobSummary:
+    """
+    Map the compact columns onto a summary. NULL times stay None.
+
+    :param row: tasks row as sqlite3.Row. Example: the row for id 7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f
+    :return: summary as JobSummary. Example: a summary with status "queued"
+    """
+    return JobSummary(
+        task_id=str(row["id"]),
+        priority=int(row["priority"]),
+        status=str(row["status"]),
+        model=str(row["model"]),
+        phase=str(row["phase"]),
+        goal=str(row["goal"]),
+        error=str(row["error"]),
+        created_at=str(row["created_at"]),
+        started_at=_optional_text(row["started_at"]),
+        finished_at=_optional_text(row["finished_at"]),
+    )
+
+
+def _delete_queued_row(connection: sqlite3.Connection, task_id: str) -> bool:
+    """
+    Delete steps and the pin only while it is still queued, then commit.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: whether one queued row was deleted as bool. Example: True
+    """
+    try:
+        _delete_steps_if_status(connection, (task_id,), (_QUEUED,))
+        cursor = connection.execute(
+            "DELETE FROM tasks WHERE id = ? AND status = ?",
+            (task_id, _QUEUED),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return False
+        connection.commit()
+        return True
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _delete_terminal_rows(
+    connection: sqlite3.Connection,
+    task_id: str | None,
+    statuses: tuple[str, ...],
+) -> tuple[JobSummary, ...]:
+    """
+    Delete the matching finished pins. A status change rolls the delete back.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: one pin id, or None for every match, as str | None. Example: None
+    :param statuses: terminal statuses as tuple[str, ...]. Example: ("completed",)
+    :return: deleted rows as tuple[JobSummary, ...]. Example: ()
+    """
+    rows = _select_terminal(connection, task_id, statuses)
+    if not rows:
+        return ()
+    ids = tuple(row.task_id for row in rows)
+    try:
+        _delete_steps_if_status(connection, ids, statuses)
+        cursor = connection.execute(_delete_tasks_sql(len(ids), len(statuses)), (*ids, *statuses))
+        if cursor.rowcount != len(ids):
+            connection.rollback()
+            return ()
+        connection.commit()
+        return _ordered_summaries(rows)
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _select_terminal(
+    connection: sqlite3.Connection,
+    task_id: str | None,
+    statuses: tuple[str, ...],
+) -> tuple[JobSummary, ...]:
+    """
+    Load finished summaries that match the filter.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: one pin id, or None for every match, as str | None. Example: None
+    :param statuses: terminal statuses as tuple[str, ...]. Example: ("failed",)
+    :return: rows as tuple[JobSummary, ...]. Example: ()
+    """
+    status_clause = _placeholders(len(statuses))
+    if task_id is None:
+        sql = f"SELECT {_SUMMARY_COLUMNS} FROM tasks WHERE status IN ({status_clause})"
+        parameters: tuple[object, ...] = statuses
+    else:
+        sql = f"SELECT {_SUMMARY_COLUMNS} FROM tasks WHERE id = ? AND status IN ({status_clause})"
+        parameters = (task_id, *statuses)
+    found = connection.execute(sql, parameters).fetchall()
+    return tuple(_summary_from_row(row) for row in found)
+
+
+def _delete_steps_if_status(
+    connection: sqlite3.Connection,
+    task_ids: tuple[str, ...],
+    statuses: tuple[str, ...],
+) -> None:
+    """
+    Delete plan steps whose parent pin still has one of the given statuses.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_ids: pin ids as tuple[str, ...]. Example: ("7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f",)
+    :param statuses: required parent statuses as tuple[str, ...]. Example: ("queued",)
+    :return: None. Example: None
+    """
+    id_clause = _placeholders(len(task_ids))
+    status_clause = _placeholders(len(statuses))
+    connection.execute(
+        f"""
+        DELETE FROM plan_steps
+        WHERE task_id IN (
+            SELECT id FROM tasks
+            WHERE id IN ({id_clause}) AND status IN ({status_clause})
+        )
+        """,
+        (*task_ids, *statuses),
+    )
+
+
+def _delete_tasks_sql(id_count: int, status_count: int) -> str:
+    """
+    SQL that deletes tasks still in the bound statuses.
+
+    :param id_count: number of id placeholders as int. Example: 1
+    :param status_count: number of status placeholders as int. Example: 2
+    :return: SQL as str. Example: "DELETE FROM tasks WHERE id IN (?) AND status IN (?, ?)"
+    """
+    return (
+        "DELETE FROM tasks "
+        f"WHERE id IN ({_placeholders(id_count)}) AND status IN ({_placeholders(status_count)})"
+    )
+
+
+def _placeholders(count: int) -> str:
+    """
+    Build a bound-parameter list. The count is not user text.
+
+    :param count: placeholder count as int. Example: 2
+    :return: comma-separated question marks as str. Example: "?, ?"
+    :raises ValueError: when count is below 1. Example: 0
+    """
+    if count < 1:
+        raise ValueError("count must be at least 1. Example: 1")
+    return ", ".join("?" for _ in range(count))
 
 
 def _require_connection(connection: sqlite3.Connection) -> None:

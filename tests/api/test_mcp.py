@@ -255,7 +255,7 @@ def test_reprioritize_running_pin_returns_not_queued(
     assert live["priority"] == 40
 
 
-def test_build_registers_four_tools_and_returns_rejected_dict(tmp_path: Path) -> None:
+def test_build_registers_dispatcher_tools_and_returns_rejected_dict(tmp_path: Path) -> None:
     """build names the server local-ai. A rejected submit is a dict, not an exception."""
     ollama, _calls = _scripted_ollama(tags_status=503, loaded_model=None)
     server = _server(tmp_path, ollama=ollama)
@@ -263,7 +263,15 @@ def test_build_registers_four_tools_and_returns_rejected_dict(tmp_path: Path) ->
 
     assert isinstance(mcp, FastMCP)
     assert mcp.name == "local-ai"
-    assert _tool_names(mcp) == ["capacity", "read", "reprioritize", "submit"]
+    assert _tool_names(mcp) == [
+        "cancel",
+        "capacity",
+        "list",
+        "purge",
+        "read",
+        "reprioritize",
+        "submit",
+    ]
     rejected = _call_tool(
         mcp,
         "submit",
@@ -276,6 +284,20 @@ def test_build_registers_four_tools_and_returns_rejected_dict(tmp_path: Path) ->
     assert rejected["reason"] == "ollama_down"
     assert rejected["task_id"] is None
     assert set(capacity) == set(_contract("capacity_down.json"))
+
+
+def test_list_cancel_and_purge_on_an_empty_board(tmp_path: Path) -> None:
+    """The operator tools return contract dicts when no pin exists."""
+    server = _server(tmp_path)
+    mcp = server.build()
+
+    listed = _call_tool(mcp, "list", {})
+    cancelled = _call_tool(mcp, "cancel", {"task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"})
+    purged = _call_tool(mcp, "purge", {})
+
+    assert listed == {"status": "ok", "count": 0, "jobs": []}
+    assert cancelled == _contract("cancel_rejected.json") | {"reason": "not_found"}
+    assert purged == {"status": "ok", "count": 0, "purged": []}
 
 
 def test_build_in_process_calls_match_contract_keys(tmp_path: Path) -> None:
@@ -331,7 +353,15 @@ def test_compose_requeues_a_running_pin_without_calling_run(
 
     assert body["status"] == "queued"
     assert mcp.name == "local-ai"
-    assert _tool_names(mcp) == ["capacity", "read", "reprioritize", "submit"]
+    assert _tool_names(mcp) == [
+        "cancel",
+        "capacity",
+        "list",
+        "purge",
+        "read",
+        "reprioritize",
+        "submit",
+    ]
     assert isinstance(server._service, DispatcherService)
     assert isinstance(server._capacity, CapacityReader)
     assert isinstance(server._slot, Slot)

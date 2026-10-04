@@ -534,6 +534,124 @@ def test_insert_pin_with_a_non_connection_raises(tmp_path: Path) -> None:
         board.insert_pin(None, _pin())  # type: ignore[arg-type]
 
 
+def test_list_summaries_orders_running_then_queue_then_newest_finished(tmp_path: Path) -> None:
+    """Running comes first, the queue keeps priority order, and finished pins are newest first."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin(task_id="failed-old", status="failed", finished_at="2026-10-04T18:50:00Z"))
+    board.insert_pin(
+        connection,
+        _pin(task_id="done-new", status="completed", finished_at="2026-10-04T18:55:00Z"),
+    )
+    board.insert_pin(connection, _pin(task_id="queue-late", priority=80, created_at="2026-10-04T18:42:00Z"))
+    board.insert_pin(connection, _pin(task_id="queue-first", priority=10, created_at="2026-10-04T18:49:00Z"))
+    board.insert_pin(connection, _pin(task_id="live", status="running", started_at="2026-10-04T18:40:02Z"))
+
+    summaries = board.list_summaries(connection, None)
+
+    assert [row.task_id for row in summaries] == [
+        "live",
+        "queue-first",
+        "queue-late",
+        "done-new",
+        "failed-old",
+    ]
+    assert summaries[0].started_at == "2026-10-04T18:40:02Z"
+    assert summaries[0].finished_at is None
+
+
+def test_list_summaries_with_one_status_excludes_the_others(tmp_path: Path) -> None:
+    """A status filter returns only that status, still in operator order."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin(task_id="queue-b", priority=20, created_at="2026-10-04T18:41:00Z"))
+    board.insert_pin(connection, _pin(task_id="queue-a", priority=20, created_at="2026-10-04T18:40:00Z"))
+    board.insert_pin(connection, _pin(status="running"))
+
+    queued = board.list_summaries(connection, "queued")
+
+    assert [row.task_id for row in queued] == ["queue-a", "queue-b"]
+
+
+def test_list_summaries_with_unknown_status_raises(tmp_path: Path) -> None:
+    """An unknown status is rejected before the select."""
+    board, connection = _open_board(tmp_path)
+
+    with pytest.raises(ValueError, match="status"):
+        board.list_summaries(connection, "done")
+
+
+def test_delete_queued_removes_the_pin_and_its_steps_only(tmp_path: Path) -> None:
+    """A queued pin and its steps disappear. A running pin and its steps stay."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+    board.insert_pin(connection, _pin(task_id="live", status="running"))
+    _insert_step(connection, _TASK_ID)
+    _insert_step(connection, "live")
+
+    removed = board.delete_queued(connection, _TASK_ID)
+
+    assert removed is True
+    assert board.get_pin(connection, _TASK_ID) is None
+    assert _step_count(connection, _TASK_ID) == 0
+    assert board.get_pin(connection, "live") is not None
+    assert _step_count(connection, "live") == 1
+
+
+def test_delete_queued_with_a_running_pin_leaves_the_row(tmp_path: Path) -> None:
+    """A pin that is no longer queued is not deleted."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin(status="running"))
+    _insert_step(connection, _TASK_ID)
+
+    assert board.delete_queued(connection, _TASK_ID) is False
+    assert board.get_pin(connection, _TASK_ID) is not None
+    assert _step_count(connection, _TASK_ID) == 1
+
+
+def test_delete_terminal_removes_finished_pins_and_leaves_the_queue(tmp_path: Path) -> None:
+    """Completed and failed rows go away. Queued and running rows stay."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin(task_id="done", status="completed", finished_at="2026-10-04T18:55:00Z"))
+    board.insert_pin(connection, _pin(task_id="bad", status="failed", finished_at="2026-10-04T18:56:00Z"))
+    board.insert_pin(connection, _pin())
+    board.insert_pin(connection, _pin(task_id="live", status="running"))
+    _insert_step(connection, "done")
+
+    removed = board.delete_terminal(connection, None, ("completed", "failed"))
+
+    assert [row.task_id for row in removed] == ["bad", "done"]
+    assert board.get_pin(connection, "done") is None
+    assert board.get_pin(connection, "bad") is None
+    assert _step_count(connection, "done") == 0
+    assert board.get_pin(connection, _TASK_ID) is not None
+    assert board.get_pin(connection, "live") is not None
+
+
+def test_delete_terminal_with_a_live_status_raises(tmp_path: Path) -> None:
+    """Queued and running cannot be passed as a purge status."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+
+    with pytest.raises(ValueError, match="completed or failed"):
+        board.delete_terminal(connection, None, ("running",))
+    assert board.get_pin(connection, _TASK_ID) is not None
+
+
+def _insert_step(connection: sqlite3.Connection, task_id: str) -> None:
+    """Insert one pending step. Example: _insert_step(connection, "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")."""
+    connection.execute(
+        "INSERT INTO plan_steps (task_id, step_order, action, status) VALUES (?, 1, ?, 'pending')",
+        (task_id, "List chapter files"),
+    )
+    connection.commit()
+
+
+def _step_count(connection: sqlite3.Connection, task_id: str) -> int:
+    """Count plan steps for one pin. Example: 1."""
+    row = connection.execute("SELECT COUNT(*) FROM plan_steps WHERE task_id = ?", (task_id,)).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
 def _open_board(tmp_path: Path) -> tuple[Blackboard, sqlite3.Connection]:
     """Open a migrated sqlite file under tmp_path. Example: (Blackboard(...), connection)."""
     database = Database(tmp_path / "local-ai.sqlite")

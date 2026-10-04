@@ -1,6 +1,6 @@
 # Local AI
 
-A dispatcher that lets Cursor, Claude Desktop, or ChatGPT hand one task at a time to a local Qwen model served by Ollama. The frontier model never gets a shell. It calls four MCP tools. The dispatcher pins the task, runs one worker, and writes progress on the pin.
+A dispatcher that lets Cursor, Claude Desktop, or ChatGPT hand one task at a time to a local Qwen model served by Ollama. The frontier model never gets a shell. It calls the dispatcher MCP tools. The dispatcher pins the task, runs one worker, and writes progress on the pin.
 
 The contract is [docs/SAO.md](docs/SAO.md). This file is how to start that server and attach it.
 
@@ -24,6 +24,9 @@ Call them in this order.
 2. `submit` — pin a task. The response `status` is `queued` even when the worker starts immediately. A following `read` shows `running`.
 3. `read` — pass `task_id` from `submit`. Repeat it to see `phase`, `steps`, and `reasoning`.
 4. `reprioritize` — change `priority` of a pin that is still `queued`.
+5. `list` — compact rows. Optional `status`: `queued`, `running`, `completed`, `failed`, or `all`.
+6. `cancel` — delete one pin that is still `queued`, plus its job folder.
+7. `purge` — delete `completed` and `failed` pins and their job folders. A `running` pin stays.
 
 `submit` fields:
 

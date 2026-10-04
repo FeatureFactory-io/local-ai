@@ -174,6 +174,35 @@ class TaskPin:
 
 
 @dataclass(frozen=True)
+class JobSummary:
+    """
+    Compact pin row for list, cancel, and purge. Reasoning and steps stay off this object.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param priority: queue rank as int. Example: 40
+    :param status: queued, running, completed, or failed as str. Example: "queued"
+    :param model: chosen size as str. Example: "qwen-14b"
+    :param phase: latest phase as str. Example: "queued"
+    :param goal: worker goal as str. Example: "Summarize the book into 2-3 pages."
+    :param error: failure summary as str. Example: ""
+    :param created_at: enqueue time as str. Example: "2026-10-04T18:40:00Z"
+    :param started_at: dispatch time as str or None. Example: None
+    :param finished_at: stop time as str or None. Example: None
+    """
+
+    task_id: str
+    priority: int
+    status: str
+    model: str
+    phase: str
+    goal: str
+    error: str = ""
+    created_at: str = ""
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+@dataclass(frozen=True)
 class PlanStep:
     """
     One durable step.

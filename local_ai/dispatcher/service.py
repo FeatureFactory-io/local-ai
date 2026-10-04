@@ -21,6 +21,7 @@ from local_ai.capacity.reader import (
 from local_ai.contracts import (
     AccessGrant,
     InvalidModel,
+    JobSummary,
     PlanStep,
     ReasoningNote,
     SubmitRequest,
@@ -40,18 +41,24 @@ _GRANT_MODES = ("job", "paths", "home")
 _JOB_MODE = "job"
 _STATUS_QUEUED = "queued"
 _STATUS_RUNNING = "running"
+_STATUS_COMPLETED = "completed"
 _STATUS_FAILED = "failed"
+_LIST_STATUSES = (_STATUS_QUEUED, _STATUS_RUNNING, _STATUS_COMPLETED, _STATUS_FAILED)
+_FILTER_ALL = "all"
 _PHASE_QUEUED = "queued"
 _REASON_OLLAMA_DOWN = "ollama_down"
 _REASON_MODEL_UNAVAILABLE = "model_unavailable"
 _STATUS_REJECTED = "rejected"
 _REASON_NOT_FOUND = "not_found"
 _REASON_NOT_QUEUED = "not_queued"
+_REASON_NOT_TERMINAL = "not_terminal"
+_REASON_NOT_STATUS = "not_status"
+_REASON_BAD_STATUS = "bad_status"
 
 
 class DispatcherService:
     """
-    Pins tasks and answers read and reprioritize.
+    Pins tasks and answers read, reprioritize, list, cancel, and purge.
 
     Collaborators: Database, Blackboard, PlanStore, CapacityReader.
     The slot calls claim_next and finish. This class does not start the worker.
@@ -208,6 +215,92 @@ class DispatcherService:
         if pin is None or pin.status != _STATUS_QUEUED:
             return _reject_reprioritize(pin, task_id)
         return _apply_queued_priority(self._blackboard, connection, pin, checked)
+
+    def list_jobs(self, status: str | None, connection: sqlite3.Connection) -> dict:
+        """
+        Return compact rows. Omitted status and all mean every pin.
+
+        An unknown status returns status rejected and reason bad_status. The queue is not changed.
+
+        :param status: filter as str | None. Example: "queued"
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :return: list body or rejection as dict. Example: {"status": "ok", "count": 0, "jobs": []}
+        :raises TypeError: when status is not a string or None, or connection is not a Connection. Example: 1
+        """
+        rejected = _reject_list_filter(status)
+        if rejected is not None:
+            logger.info("dispatcher.list | rejected | reason=%s filter=%s", _REASON_BAD_STATUS, status)
+            return rejected
+        summaries = self._blackboard.list_summaries(connection, _list_query_status(status))
+        body = _list_body(summaries)
+        logger.info("dispatcher.list | ok | filter=%s count=%s", status or _FILTER_ALL, body["count"])
+        return body
+
+    def cancel(self, task_id: str, connection: sqlite3.Connection) -> dict:
+        """
+        Delete one queued pin, its steps, and its job-folder entry.
+
+        A running, completed, or failed pin returns status rejected and reason not_queued.
+        A missing pin returns reason not_found. Neither rejection deletes a row or a folder.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :return: cancelled or rejected body as dict. Example: {"status": "cancelled", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", "job_dir_removed": true}
+        :raises TypeError: when connection is not a Connection. Example: None
+        :raises ValueError: when task_id is blank or not one path segment. Example: "../other"
+        """
+        pin = self._blackboard.get_pin(connection, task_id)
+        if pin is None or pin.status != _STATUS_QUEUED:
+            return _reject_cancel(pin, task_id)
+        if not self._blackboard.delete_queued(connection, task_id):
+            return _reject_cancel(self._blackboard.get_pin(connection, task_id), task_id)
+        removed = _remove_job_directory(self._jobs_root, task_id)
+        logger.info("dispatcher.cancel | cancelled | task_id=%s job_dir_removed=%s", task_id, removed)
+        return {"status": "cancelled", "task_id": task_id, "job_dir_removed": removed}
+
+    def purge(
+        self,
+        task_id: str | None,
+        status: str | None,
+        connection: sqlite3.Connection,
+    ) -> dict:
+        """
+        Delete finished pins and their job-folder entries.
+
+        Omitted status deletes completed and failed. A queued or running task_id returns
+        reason not_terminal. A status of queued, running, or all returns reason bad_status
+        and deletes nothing.
+
+        :param task_id: one pin id, or None for every match, as str | None. Example: None
+        :param status: completed, failed, or None as str | None. Example: "completed"
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :return: purge body or rejection as dict. Example: {"status": "ok", "count": 0, "purged": []}
+        :raises TypeError: when status is not a string or None, or connection is not a Connection. Example: 1
+        :raises ValueError: when task_id is blank or not one path segment. Example: " "
+        """
+        rejected = _reject_purge_filter(status)
+        if rejected is not None:
+            logger.info("dispatcher.purge | rejected | reason=%s filter=%s", _REASON_BAD_STATUS, status)
+            return rejected
+        if task_id is not None:
+            blocked = self._purge_block(connection, task_id, status)
+            if blocked is not None:
+                return blocked
+        removed = self._blackboard.delete_terminal(connection, task_id, _purge_statuses(status))
+        if task_id is not None and not removed:
+            return self._purge_block(connection, task_id, status) or _rejected_task(task_id, _REASON_NOT_FOUND)
+        return _purge_body(removed, self._jobs_root)
+
+    def _purge_block(self, connection: sqlite3.Connection, task_id: str, status: str | None) -> dict | None:
+        """
+        Reject a pin that purge must leave in place. None means the pin may be deleted.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param status: requested status as str | None. Example: "failed"
+        :return: rejection or None as dict | None. Example: None
+        """
+        return _reject_purge_target(self._blackboard.get_pin(connection, task_id), task_id, status)
 
     def claim_next(self, connection: sqlite3.Connection, started_at: str) -> TaskPin | None:
         """
@@ -654,6 +747,234 @@ def _reject_reprioritize(pin: TaskPin | None, task_id: str) -> dict:
         pin.status,
     )
     return _rejected_task(task_id, _REASON_NOT_QUEUED)
+
+
+def _reject_list_filter(status: object) -> dict | None:
+    """
+    Reject an unknown list filter. None and all mean every pin.
+
+    :param status: filter as object. Example: "queued"
+    :return: rejection or None as dict | None. Example: None
+    :raises TypeError: when status is not a string or None. Example: 1
+    """
+    if status is None or status == _FILTER_ALL or status in _LIST_STATUSES:
+        return None
+    if not isinstance(status, str):
+        raise TypeError("status must be a string or omitted. Example: 'queued'")
+    return {"status": _STATUS_REJECTED, "reason": _REASON_BAD_STATUS, "filter": status}
+
+
+def _list_query_status(status: str | None) -> str | None:
+    """
+    Turn all into an unfiltered query. The caller has already accepted the value.
+
+    :param status: filter as str | None. Example: "all"
+    :return: status or None as str | None. Example: None
+    """
+    if status is None or status == _FILTER_ALL:
+        return None
+    return status
+
+
+def _list_body(summaries: tuple[JobSummary, ...]) -> dict:
+    """
+    Map summaries onto the list contract. Position counts only queued rows.
+
+    :param summaries: ordered rows as tuple[JobSummary, ...]. Example: ()
+    :return: list body as dict. Example: {"status": "ok", "count": 0, "jobs": []}
+    """
+    positions = _queued_positions(summaries)
+    jobs = [_job_row(row, positions.get(row.task_id)) for row in summaries]
+    return {"status": "ok", "count": len(jobs), "jobs": jobs}
+
+
+def _queued_positions(summaries: tuple[JobSummary, ...]) -> dict[str, int]:
+    """
+    Number queued rows in their current order, starting at 1.
+
+    :param summaries: ordered rows as tuple[JobSummary, ...]. Example: ()
+    :return: positions by task id as dict[str, int]. Example: {}
+    """
+    queued = [row.task_id for row in summaries if row.status == _STATUS_QUEUED]
+    return {task_id: index for index, task_id in enumerate(queued, start=1)}
+
+
+def _job_row(row: JobSummary, position: int | None) -> dict:
+    """
+    Map one summary onto a list job object.
+
+    :param row: compact pin as JobSummary. Example: a summary with status "queued"
+    :param position: queue place, or None when the pin is not queued, as int | None. Example: 1
+    :return: job object as dict. Example: {"task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", "position": 1}
+    """
+    return {
+        "task_id": row.task_id,
+        "status": row.status,
+        "priority": row.priority,
+        "model": row.model,
+        "phase": row.phase,
+        "goal": row.goal,
+        "error": row.error,
+        "created_at": row.created_at,
+        "started_at": row.started_at,
+        "finished_at": row.finished_at,
+        "position": position,
+    }
+
+
+def _reject_cancel(pin: TaskPin | None, task_id: str) -> dict:
+    """
+    Reject a pin that is missing or not queued. Neither branch deletes.
+
+    :param pin: loaded pin as TaskPin | None. Example: None
+    :param task_id: requested pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: rejected body as dict. Example: {"status": "rejected", "reason": "not_queued", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"}
+    """
+    if pin is None:
+        logger.info("dispatcher.cancel | not_found | task_id=%s", task_id)
+        return _rejected_task(task_id, _REASON_NOT_FOUND)
+    logger.info("dispatcher.cancel | not_queued | task_id=%s status=%s", task_id, pin.status)
+    return _rejected_task(task_id, _REASON_NOT_QUEUED)
+
+
+def _reject_purge_filter(status: object) -> dict | None:
+    """
+    Accept omitted, completed, or failed. Anything else is bad_status.
+
+    :param status: filter as object. Example: "completed"
+    :return: rejection or None as dict | None. Example: None
+    :raises TypeError: when status is not a string or None. Example: 1
+    """
+    if status is None or status in (_STATUS_COMPLETED, _STATUS_FAILED):
+        return None
+    if not isinstance(status, str):
+        raise TypeError("status must be a string or omitted. Example: 'completed'")
+    return {"status": _STATUS_REJECTED, "reason": _REASON_BAD_STATUS, "filter": status}
+
+
+def _purge_statuses(status: str | None) -> tuple[str, ...]:
+    """
+    Expand an omitted filter to both finished statuses.
+
+    :param status: completed, failed, or None as str | None. Example: None
+    :return: statuses as tuple[str, ...]. Example: ("completed", "failed")
+    """
+    if status is None:
+        return (_STATUS_COMPLETED, _STATUS_FAILED)
+    return (status,)
+
+
+def _reject_purge_target(pin: TaskPin | None, task_id: str, status: str | None) -> dict | None:
+    """
+    Reject a missing pin, a live pin, or a finished pin outside the requested status.
+
+    :param pin: loaded pin as TaskPin | None. Example: None
+    :param task_id: requested pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param status: requested status as str | None. Example: "failed"
+    :return: rejection or None as dict | None. Example: None
+    """
+    if pin is None:
+        logger.info("dispatcher.purge | not_found | task_id=%s", task_id)
+        return _rejected_task(task_id, _REASON_NOT_FOUND)
+    if pin.status not in (_STATUS_COMPLETED, _STATUS_FAILED):
+        logger.info("dispatcher.purge | not_terminal | task_id=%s status=%s", task_id, pin.status)
+        return _rejected_task(task_id, _REASON_NOT_TERMINAL)
+    if status is not None and pin.status != status:
+        logger.info(
+            "dispatcher.purge | not_status | task_id=%s status=%s filter=%s",
+            task_id,
+            pin.status,
+            status,
+        )
+        rejected = _rejected_task(task_id, _REASON_NOT_STATUS)
+        rejected["filter"] = status
+        return rejected
+    return None
+
+
+def _purge_body(removed: tuple[JobSummary, ...], jobs_root: Path) -> dict:
+    """
+    Remove each job-folder entry and return the purge contract.
+
+    :param removed: deleted pins as tuple[JobSummary, ...]. Example: ()
+    :param jobs_root: job directory root as Path. Example: Path("data/jobs")
+    :return: purge body as dict. Example: {"status": "ok", "count": 0, "purged": []}
+    """
+    purged = [_purged_row(row, jobs_root) for row in removed]
+    logger.info("dispatcher.purge | ok | count=%s", len(purged))
+    return {"status": "ok", "count": len(purged), "purged": purged}
+
+
+def _purged_row(row: JobSummary, jobs_root: Path) -> dict:
+    """
+    Remove one job-folder entry and report the prior status.
+
+    :param row: deleted pin as JobSummary. Example: a summary with status "completed"
+    :param jobs_root: job directory root as Path. Example: Path("data/jobs")
+    :return: purged object as dict. Example: {"task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", "prior_status": "completed", "job_dir_removed": true}
+    """
+    return {
+        "task_id": row.task_id,
+        "prior_status": row.status,
+        "job_dir_removed": _remove_job_directory(jobs_root, row.task_id),
+    }
+
+
+def _remove_job_directory(jobs_root: Path, task_id: str) -> bool:
+    """
+    Remove the direct child of the job root. A symlink is unlinked, not followed.
+
+    :param jobs_root: job directory root as Path. Example: Path("data/jobs")
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: whether the job-root entry was removed as bool. Example: True
+    :raises TypeError: when jobs_root is not a Path. Example: "data/jobs"
+    :raises ValueError: when task_id is not one path segment. Example: "../other"
+    """
+    checked = _require_task_id(task_id)
+    if not isinstance(jobs_root, Path):
+        raise TypeError("jobs_root must be Path. Example: Path('data/jobs')")
+    entry = jobs_root / checked
+    if not entry.exists() and not entry.is_symlink():
+        logger.info("dispatcher.remove_job_dir | missing | task_id=%s", checked)
+        return False
+    if entry.is_symlink() or entry.is_file():
+        entry.unlink()
+        logger.info("dispatcher.remove_job_dir | unlinked | task_id=%s", checked)
+        return True
+    if not _job_directory_is_inside(entry, jobs_root):
+        logger.warning("dispatcher.remove_job_dir | outside_root | task_id=%s", checked)
+        return False
+    shutil.rmtree(entry)
+    logger.info("dispatcher.remove_job_dir | removed | task_id=%s", checked)
+    return True
+
+
+def _job_directory_is_inside(entry: Path, jobs_root: Path) -> bool:
+    """
+    True when the resolved job directory is a strict child of the job root.
+
+    :param entry: job directory as Path. Example: Path("data/jobs/7c1e0a2e")
+    :param jobs_root: job directory root as Path. Example: Path("data/jobs")
+    :return: whether the directory stays inside the root as bool. Example: True
+    """
+    resolved = entry.resolve()
+    root = jobs_root.resolve()
+    return resolved != root and _is_relative_to(resolved, root)
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    """
+    True when path is root or a path under root.
+
+    :param path: candidate path as Path. Example: Path("/data/jobs/7c1e0a2e")
+    :param root: parent path as Path. Example: Path("/data/jobs")
+    :return: whether path stays under root as bool. Example: True
+    """
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def _apply_queued_priority(

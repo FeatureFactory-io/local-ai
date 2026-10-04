@@ -100,14 +100,14 @@ class LocalAiServer:
 
     def build(self) -> FastMCP:
         """
-        Register the four tools on a FastMCP server.
+        Register the dispatcher tools on a FastMCP server.
 
         :return: FastMCP server. Example: a server named "local-ai"
         """
         logger.info("build | entry | name=%s", _SERVER_NAME)
         mcp = FastMCP(_SERVER_NAME, host=_LOOPBACK_HOST)
         _register_tools(mcp, self)
-        logger.info("build | exit | tools=capacity,submit,read,reprioritize")
+        logger.info("build | exit | tools=capacity,submit,read,reprioritize,list,cancel,purge")
         return mcp
 
     def capacity(self) -> dict:
@@ -189,6 +189,50 @@ class LocalAiServer:
         _require_text(task_id, "task_id", "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
         body = self._service.reprioritize(task_id, priority, self._connection)
         logger.info("reprioritize | exit | status=%s", body.get("status"))
+        return body
+
+    def list_jobs(self, status: str | None = None) -> dict:
+        """
+        Compact rows for the queue, the running pin, and finished pins.
+
+        :param status: queued, running, completed, failed, all, or omitted as str | None. Example: "queued"
+        :return: list body as dict. Example: {"status": "ok", "count": 0, "jobs": []}
+        :raises TypeError: when status is not a string or None. Example: 1
+        """
+        logger.info("list | entry")
+        body = self._service.list_jobs(status, self._connection)
+        logger.info("list | exit | status=%s", body.get("status"))
+        return body
+
+    def cancel(self, task_id: str) -> dict:
+        """
+        Delete one queued pin and its job folder.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :return: cancelled or rejected body as dict. Example: {"status": "cancelled", "job_dir_removed": true}
+        :raises ValueError: when task_id is blank. Example: "  "
+        """
+        logger.info("cancel | entry")
+        _require_text(task_id, "task_id", "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+        body = self._service.cancel(task_id, self._connection)
+        logger.info("cancel | exit | status=%s", body.get("status"))
+        return body
+
+    def purge(self, task_id: str | None = None, status: str | None = None) -> dict:
+        """
+        Delete finished pins and their job folders.
+
+        :param task_id: one pin id, or omitted for every match, as str | None. Example: None
+        :param status: completed, failed, or omitted as str | None. Example: "completed"
+        :return: purge body as dict. Example: {"status": "ok", "count": 0, "purged": []}
+        :raises ValueError: when task_id is blank. Example: "  "
+        :raises TypeError: when status is not a string or None. Example: 1
+        """
+        logger.info("purge | entry")
+        if task_id is not None:
+            _require_text(task_id, "task_id", "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+        body = self._service.purge(task_id, status, self._connection)
+        logger.info("purge | exit | status=%s", body.get("status"))
         return body
 
 
@@ -296,7 +340,7 @@ def _store_probes(
 
 def _register_tools(mcp: FastMCP, server: "LocalAiServer") -> None:
     """
-    Register the four tools. Each returns its dict, including a rejection.
+    Register the dispatcher tools. Each returns its dict, including a rejection.
 
     :param mcp: FastMCP server as FastMCP. Example: a server named "local-ai"
     :param server: tool owner as LocalAiServer. Example: the composed server
@@ -306,6 +350,9 @@ def _register_tools(mcp: FastMCP, server: "LocalAiServer") -> None:
     mcp.add_tool(server.submit)
     mcp.add_tool(server.read)
     mcp.add_tool(server.reprioritize)
+    mcp.add_tool(server.list_jobs, name="list")
+    mcp.add_tool(server.cancel)
+    mcp.add_tool(server.purge)
 
 
 def _submit_request(
