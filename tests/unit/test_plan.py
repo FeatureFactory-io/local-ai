@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from local_ai.contracts import PlanStep, StepDraft
+from local_ai.contracts import InvalidStepTransition, PlanStep, StepDraft
 from local_ai.db.database import Database
 from local_ai.plan.steps import PlanStore
 
@@ -161,6 +161,49 @@ def test_list_steps_ignores_another_pins_steps(tmp_path: Path) -> None:
     assert steps == (PlanStep(_TASK_ID, 1, "List chapter files", "pending"),)
 
 
+@pytest.mark.parametrize("status", ["pending", "waiting_retry"])
+def test_mark_running_moves_an_open_step_to_running(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    status: str,
+) -> None:
+    """pending and waiting_retry become running. The log records task_id and order."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(2, "Write a thesis per chapter"),))
+    _set_status(connection, _TASK_ID, 2, status)
+
+    with caplog.at_level(logging.INFO, logger="local_ai.plan.steps"):
+        store.mark_running(connection, _TASK_ID, 2)
+
+    assert _step_rows(connection, _TASK_ID)[0]["status"] == "running"
+    assert _TASK_ID in caplog.text
+    assert "order=2" in caplog.text
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "running"])
+def test_mark_running_rejects_a_closed_or_running_step(tmp_path: Path, status: str) -> None:
+    """completed, failed, and running stay put and raise InvalidStepTransition."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(1, "List chapter files"),))
+    _set_status(connection, _TASK_ID, 1, status)
+
+    with pytest.raises(InvalidStepTransition):
+        store.mark_running(connection, _TASK_ID, 1)
+
+    assert _step_rows(connection, _TASK_ID)[0]["status"] == status
+
+
+def test_mark_running_rejects_a_missing_step(tmp_path: Path) -> None:
+    """A missing order is not a transition."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(1, "List chapter files"),))
+
+    with pytest.raises(InvalidStepTransition, match="order=9"):
+        store.mark_running(connection, _TASK_ID, 9)
+
+    assert _step_rows(connection, _TASK_ID)[0]["status"] == "pending"
+
+
 def test_list_steps_rejects_a_blank_task_id(tmp_path: Path) -> None:
     """A blank pin id is not a query."""
     store, connection = _open_store(tmp_path)
@@ -214,6 +257,21 @@ def _insert_task(connection: sqlite3.Connection, task_id: str) -> None:
             "acting",
             "2026-10-04T18:40:00Z",
         ),
+    )
+
+
+def _set_status(connection: sqlite3.Connection, task_id: str, order: int, status: str) -> None:
+    """Force one step status so a transition test can start from it.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param order: step order as int. Example: 1
+    :param status: step status as str. Example: "waiting_retry"
+    :return: None. Example: None
+    """
+    connection.execute(
+        "UPDATE plan_steps SET status = ? WHERE task_id = ? AND step_order = ?",
+        (status, task_id, order),
     )
 
 

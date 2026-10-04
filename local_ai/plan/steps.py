@@ -9,6 +9,9 @@ from local_ai.db.database import Database
 logger = logging.getLogger(__name__)
 
 _STATUS_PENDING = "pending"
+_STATUS_RUNNING = "running"
+_STATUS_WAITING_RETRY = "waiting_retry"
+_MARK_RUNNING_SOURCES = frozenset({_STATUS_PENDING, _STATUS_WAITING_RETRY})
 _MIN_STEP_ORDER = 1
 
 
@@ -75,12 +78,13 @@ class PlanStore:
         :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param order: step order as int. Example: 2
         :return: None. Example: None
-        :raises InvalidStepTransition: when the step is completed. Example: order 1 already completed
+        :raises InvalidStepTransition: when the step is completed, failed, running, or missing. Example: order 1 already completed
+        :raises ValueError: when order is below 1. Example: 0
         """
-        # Allowed sources: pending, waiting_retry.
-        # completed, failed, and running raise InvalidStepTransition.
-        # Log task_id and order at INFO.
-        raise NotImplementedError
+        self._require_step_address(connection, task_id, order)
+        self._require_mark_running_source(connection, task_id, order)
+        self._set_status(connection, task_id, order, _STATUS_RUNNING)
+        logger.info("PlanStore.mark_running task_id=%s order=%s", task_id, order)
 
     def complete_step(
         self,
@@ -306,6 +310,90 @@ class PlanStore:
         ).fetchone()
         if row is not None:
             raise ValueError(f"step order {int(row['step_order'])} already exists for task_id={task_id}")
+
+    def _require_step_address(self, connection: sqlite3.Connection, task_id: str, order: int) -> None:
+        """
+        Reject a connection, pin, or order the state machine cannot address.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :return: None. Example: None
+        :raises TypeError: when connection is not sqlite3.Connection. Example: None
+        :raises ValueError: when task_id is blank or order is below 1. Example: 0
+        """
+        self._require_connection(connection)
+        self._require_task_id(task_id)
+        self._require_order(order)
+
+    def _require_order(self, order: int) -> None:
+        """
+        Reject an order that is not an int of at least 1.
+
+        :param order: step order as int. Example: 2
+        :return: None. Example: None
+        :raises ValueError: when order is below 1. Example: 0
+        :raises TypeError: when order is not an int. Example: "2"
+        """
+        if isinstance(order, bool) or not isinstance(order, int):
+            raise TypeError(f"order must be int, got {type(order).__name__}")
+        if order < _MIN_STEP_ORDER:
+            raise ValueError(f"order must be an int >= {_MIN_STEP_ORDER}, got {order}")
+
+    def _require_mark_running_source(self, connection: sqlite3.Connection, task_id: str, order: int) -> None:
+        """
+        Allow only pending and waiting_retry to become running.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :return: None. Example: None
+        :raises InvalidStepTransition: when the step is completed, failed, running, or missing. Example: order 1 already completed
+        """
+        status = self._require_step_status(connection, task_id, order)
+        if status not in _MARK_RUNNING_SOURCES:
+            logger.info(
+                "PlanStore.mark_running rejected task_id=%s order=%s status=%s",
+                task_id,
+                order,
+                status,
+            )
+            raise InvalidStepTransition(
+                f"cannot mark_running from status={status} task_id={task_id} order={order}"
+            )
+
+    def _require_step_status(self, connection: sqlite3.Connection, task_id: str, order: int) -> str:
+        """
+        Return the current status of one step.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :return: status as str. Example: "pending"
+        :raises InvalidStepTransition: when that order is missing. Example: order 9
+        """
+        row = connection.execute(
+            "SELECT status FROM plan_steps WHERE task_id = ? AND step_order = ?",
+            (task_id, order),
+        ).fetchone()
+        if row is None:
+            raise InvalidStepTransition(f"no step task_id={task_id} order={order}")
+        return str(row["status"])
+
+    def _set_status(self, connection: sqlite3.Connection, task_id: str, order: int, status: str) -> None:
+        """
+        Write one step's status.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :param status: next status as str. Example: "running"
+        :return: None. Example: None
+        """
+        connection.execute(
+            "UPDATE plan_steps SET status = ? WHERE task_id = ? AND step_order = ?",
+            (status, task_id, order),
+        )
 
     def _select_steps(self, connection: sqlite3.Connection, task_id: str) -> list[sqlite3.Row]:
         """
