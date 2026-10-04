@@ -168,10 +168,19 @@ class Blackboard:
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param priority: new priority as int. Example: 10
         :return: None. Example: None
+        :raises TypeError: when connection is not a Connection or priority is not an int. Example: True
+        :raises ValueError: when task_id is blank or the pin is missing. Example: "missing-id"
         """
-        # Update priority only. Do not change status.
-        # Log task_id and priority at INFO.
-        raise NotImplementedError
+        _require_connection(connection)
+        _require_task_id(task_id)
+        _require_priority(priority)
+        _update_one(
+            connection,
+            "UPDATE tasks SET priority = ? WHERE id = ?",
+            (priority, task_id),
+            task_id,
+        )
+        logger.info("blackboard.update_priority | task_id=%s | priority=%s", task_id, priority)
 
     def claim(self, connection: sqlite3.Connection, task_id: str, started_at: str) -> bool:
         """
@@ -240,6 +249,18 @@ def _require_pin(pin: TaskPin) -> None:
     _require_task_id(pin.task_id)
     if not isinstance(pin.access, AccessGrant):
         raise TypeError("pin.access must be AccessGrant. Example: AccessGrant('job')")
+
+
+def _require_priority(priority: object) -> None:
+    """
+    Reject a priority that is not an int. Bool is rejected because it is a subclass of int.
+
+    :param priority: candidate priority as object. Example: 10
+    :return: None. Example: None
+    :raises TypeError: when priority is not an int. Example: True
+    """
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise TypeError("priority must be int. Example: 10")
 
 
 def _require_text(value: object, name: str, example: str) -> None:

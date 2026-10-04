@@ -181,6 +181,46 @@ def test_append_reasoning_with_unknown_id_raises(tmp_path: Path) -> None:
     assert connection.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 0
 
 
+def test_update_priority_changes_priority_only(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Priority changes. Status is left to the caller."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin(status="running", priority=40))
+    caplog.set_level(logging.INFO, logger="local_ai.blackboard.pins")
+
+    board.update_priority(connection, _TASK_ID, 10)
+
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.priority == 10
+    assert loaded.status == "running"
+    assert any(
+        record.levelno == logging.INFO
+        and f"task_id={_TASK_ID}" in record.message
+        and "priority=10" in record.message
+        for record in caplog.records
+    )
+
+
+def test_update_priority_with_unknown_id_raises(tmp_path: Path) -> None:
+    """A missing pin is not created by a priority change."""
+    board, connection = _open_board(tmp_path)
+
+    with pytest.raises(ValueError, match="task_id"):
+        board.update_priority(connection, _TASK_ID, 10)
+
+
+def test_update_priority_with_a_bool_raises(tmp_path: Path) -> None:
+    """True is not a queue priority."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+
+    with pytest.raises(TypeError, match="priority"):
+        board.update_priority(connection, _TASK_ID, True)  # type: ignore[arg-type]
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.priority == 40
+
+
 def test_set_phase_updates_phase_and_plan(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """Phase and the readable plan change together. Status stays put."""
     board, connection = _open_board(tmp_path)
