@@ -29,8 +29,8 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "contracts"
 _HOST = "http://127.0.0.1:11434"
 _TAGS = f"{_HOST}/api/tags"
 _PS = f"{_HOST}/api/ps"
-_JOIN_TIMEOUT_S = 5.0
-_HOLD_COMMAND = "python3 -c \"import time; time.sleep(2)\""
+_JOIN_TIMEOUT_S = 8.0
+_HOLD_COMMAND = "python3 -c \"open('awake.txt','w').write('1'); import time; time.sleep(4)\""
 _HOLD_SCRIPT = (
     Completion(content="1. Pause in the job folder"),
     Completion(tool_calls=(ToolCall("shell", _HOLD_COMMAND),), final_answer="Paused"),
@@ -129,11 +129,14 @@ def test_capacity_when_tags_fail_returns_the_down_body(tmp_path: Path) -> None:
 def test_submit_returns_the_queued_snapshot_after_kick_claims(tmp_path: Path) -> None:
     """The tool returns status queued. kick has already claimed the pin, so a later read is running."""
     server = _server(tmp_path, script=_HOLD_SCRIPT)
+    held: str | None = None
     try:
         body = server.submit("Write a brief.", "brief.md exists", priority=40, model="qwen-14b")
-        live = server._service.read_pin(str(body["task_id"]), server._connection)
+        held = str(body["task_id"])
+        _wait_until_holding(tmp_path, held)
+        live = server._service.read_pin(held, server._connection)
     finally:
-        _join_slot(server)
+        _release_and_join(tmp_path, server, held)
 
     assert set(body) == set(_contract("submit_queued.json"))
     assert body["status"] == "queued"
@@ -162,11 +165,14 @@ def test_submit_when_ollama_is_down_returns_rejected_without_kick(
 def test_read_returns_the_pin_body(tmp_path: Path) -> None:
     """read returns the read_pin body. Keys match the running example."""
     server = _server(tmp_path, script=_HOLD_SCRIPT)
+    held: str | None = None
     try:
         queued = server.submit("Write a brief.", "brief.md exists", priority=40, model="qwen-14b")
-        body = server.read(str(queued["task_id"]))
+        held = str(queued["task_id"])
+        _wait_until_holding(tmp_path, held)
+        body = server.read(held)
     finally:
-        _join_slot(server)
+        _release_and_join(tmp_path, server, held)
 
     assert set(body) == set(_contract("read_running.json"))
     assert body["status"] == "running"
@@ -193,16 +199,19 @@ def test_reprioritize_queued_pin_returns_the_new_position_without_kicking(
     """A queued pin changes priority. The slot is not called, so it stays queued."""
     server = _server(tmp_path, script=_HOLD_SCRIPT)
     caplog.set_level(logging.INFO)
+    held: str | None = None
     try:
         first = server.submit("Write the first brief.", "brief.md exists", priority=40, model="qwen-14b")
+        held = str(first["task_id"])
+        _wait_until_holding(tmp_path, held)
         second = server.submit("Write the second brief.", "brief.md exists", priority=80, model="qwen-14b")
         kicks_before = _kick_count(caplog)
         body = server.reprioritize(str(second["task_id"]), 5)
         queued = server.read(str(second["task_id"]))
-        running = server.read(str(first["task_id"]))
+        running = server.read(held)
         kicks_after = _kick_count(caplog)
     finally:
-        _join_slot(server)
+        _release_and_join(tmp_path, server, held)
 
     assert second["status"] == "queued"
     assert set(body) == set(_contract("reprioritize_queued.json"))
@@ -223,14 +232,17 @@ def test_reprioritize_running_pin_returns_not_queued(
     """A running pin is rejected and its priority stays put. The slot is not called."""
     server = _server(tmp_path, script=_HOLD_SCRIPT)
     caplog.set_level(logging.INFO)
+    held: str | None = None
     try:
         first = server.submit("Write a brief.", "brief.md exists", priority=40, model="qwen-14b")
+        held = str(first["task_id"])
+        _wait_until_holding(tmp_path, held)
         kicks_before = _kick_count(caplog)
-        body = server.reprioritize(str(first["task_id"]), 5)
-        live = server.read(str(first["task_id"]))
+        body = server.reprioritize(held, 5)
+        live = server.read(held)
         kicks_after = _kick_count(caplog)
     finally:
-        _join_slot(server)
+        _release_and_join(tmp_path, server, held)
 
     assert set(body) == set(_contract("reprioritize_rejected.json"))
     assert body == {
@@ -270,23 +282,26 @@ def test_build_in_process_calls_match_contract_keys(tmp_path: Path) -> None:
     """In-process tool calls return the section 18 keys for up, queued, running, and reprioritize."""
     server = _server(tmp_path, script=_HOLD_SCRIPT)
     mcp = server.build()
+    held: str | None = None
     try:
         queued = _call_tool(
             mcp,
             "submit",
             {"goal": "Write a brief.", "done_when": "brief.md exists", "priority": 40, "model": "qwen-14b"},
         )
-        read_body = _call_tool(mcp, "read", {"task_id": queued["task_id"]})
+        held = str(queued["task_id"])
+        _wait_until_holding(tmp_path, held)
+        read_body = _call_tool(mcp, "read", {"task_id": held})
         second = _call_tool(
             mcp,
             "submit",
             {"goal": "Write the second brief.", "done_when": "brief.md exists", "priority": 80, "model": "qwen-14b"},
         )
         changed = _call_tool(mcp, "reprioritize", {"task_id": second["task_id"], "priority": 5})
-        rejected = _call_tool(mcp, "reprioritize", {"task_id": queued["task_id"], "priority": 5})
+        rejected = _call_tool(mcp, "reprioritize", {"task_id": held, "priority": 5})
         capacity = _call_tool(mcp, "capacity", {})
     finally:
-        _join_slot(server)
+        _release_and_join(tmp_path, server, held)
 
     assert set(queued) == set(_contract("submit_queued.json"))
     assert queued["status"] == "queued"
@@ -594,21 +609,61 @@ def _kick_count(caplog: pytest.LogCaptureFixture) -> int:
     return sum(1 for record in caplog.records if record.message == "Starting kick")
 
 
+def _wait_until_holding(tmp_path: Path, task_id: str, timeout: float = _JOIN_TIMEOUT_S) -> None:
+    """
+    Wait until the worker is blocked in the shell, so the test thread is not in sqlite with it.
+
+    :param tmp_path: pytest directory as Path. Example: Path("/tmp/pytest/test0")
+    :param task_id: running pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param timeout: seconds to wait as float. Example: 5.0
+    :return: None. Example: None
+    :raises AssertionError: when awake.txt does not appear. Example: a denied shell
+    """
+    marker = tmp_path / "jobs" / task_id / "awake.txt"
+    deadline = time.monotonic() + timeout
+    while not marker.is_file():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"hold marker missing path={marker}")
+        time.sleep(0.01)
+
+
+def _release_and_join(tmp_path: Path, server: LocalAiServer, task_id: str | None) -> None:
+    """
+    Let the holding shell exit, then wait until the slot thread stops.
+
+    :param tmp_path: pytest directory as Path. Example: Path("/tmp/pytest/test0")
+    :param server: server under test as LocalAiServer. Example: the server from _server
+    :param task_id: holding pin as str | None. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: None. Example: None
+    """
+    if task_id:
+        release = tmp_path / "jobs" / task_id / "release"
+        release.parent.mkdir(parents=True, exist_ok=True)
+        release.write_text("1", encoding="utf-8")
+    _join_slot(server)
+
+
 def _join_slot(server: LocalAiServer, timeout: float = _JOIN_TIMEOUT_S) -> None:
     """
-    Wait until the slot thread stops so the temp job can be removed.
+    Wait until the slot thread and any pin it starts next have stopped.
 
     :param server: server under test as LocalAiServer. Example: the server from _server
     :param timeout: seconds to wait as float. Example: 5.0
     :return: None. Example: None
+    :raises AssertionError: when a worker is still alive at the deadline. Example: a stuck sleep
     """
-    thread = server._slot._thread
-    if thread is None:
-        return
     deadline = time.monotonic() + timeout
-    thread.join(timeout=timeout)
-    if thread.is_alive() and time.monotonic() >= deadline:
-        return
+    while time.monotonic() < deadline:
+        thread = server._slot._thread
+        if thread is None:
+            return
+        remaining = deadline - time.monotonic()
+        thread.join(timeout=remaining)
+        if thread.is_alive():
+            break
+        if server._slot._thread is None or server._slot._thread is thread:
+            return
+    raise AssertionError("slot thread did not finish")
 
 
 def _contract(name: str) -> dict:
