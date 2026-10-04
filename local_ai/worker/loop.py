@@ -1,5 +1,7 @@
 """Agent loop for the one running task. The slot calls run_task. This module does not import dispatcher."""
 
+import logging
+import re
 import sqlite3
 
 from local_ai.blackboard.pins import Blackboard
@@ -8,6 +10,12 @@ from local_ai.llm.port import LlmPort, split_note
 from local_ai.plan.steps import PlanStore
 from local_ai.prompt.assemble import PromptAssembler
 from local_ai.tools.shell import ShellTool
+
+
+logger = logging.getLogger(__name__)
+
+_NUMBERED_STEP = re.compile(r"^(\d+)\.\s+(\S.*?)\s*$")
+_MIN_STEP_ORDER = 1
 
 
 class Worker:
@@ -70,10 +78,14 @@ class Worker:
         :param completion: planning turn as Completion. Example: Completion(content="1. List chapter files")
         :return: drafts as tuple[StepDraft, ...]. Example: (StepDraft(1, "List chapter files"),)
         :raises ValueError: when the completion names no step. Example: Completion()
+        :raises TypeError: when completion is not a Completion. Example: None
         """
-        # Parse numbered lines from final_answer or content into StepDraft values.
-        # An empty parse raises ValueError so run_task can fail the pin.
-        raise NotImplementedError
+        drafts = _drafts_from_completion(completion)
+        if not drafts:
+            logger.info("Worker.parse_plan rejected reason=empty")
+            raise ValueError("completion names no step. Example: Completion()")
+        logger.info("Worker.parse_plan count=%s", len(drafts))
+        return tuple(drafts)
 
     def run_round(self, task_id: str, order: int, prompt: str, model_name: str) -> Completion:
         """
@@ -161,3 +173,52 @@ class Worker:
 
 _ROUNDS = MAX_ROUNDS_PER_STEP
 _IDENTICAL = MAX_IDENTICAL_FAILURES
+
+
+def _drafts_from_completion(completion: Completion) -> list[StepDraft]:
+    """
+    Read numbered lines from the final answer, then from content.
+
+    :param completion: planning turn as Completion. Example: Completion(content="1. List chapter files")
+    :return: drafts as list[StepDraft]. Example: [StepDraft(1, "List chapter files")]
+    :raises TypeError: when completion is not a Completion. Example: None
+    """
+    if not isinstance(completion, Completion):
+        raise TypeError(
+            "completion must be Completion. Example: Completion(content='1. List chapter files')"
+        )
+    from_answer = _numbered_drafts(completion.final_answer)
+    if from_answer:
+        return from_answer
+    return _numbered_drafts(completion.content)
+
+
+def _numbered_drafts(text: str) -> list[StepDraft]:
+    """
+    Keep lines that start with an order and a sentence.
+
+    :param text: model text as str. Example: "1. List chapter files"
+    :return: drafts as list[StepDraft]. Example: [StepDraft(1, "List chapter files")]
+    """
+    drafts: list[StepDraft] = []
+    for line in text.splitlines():
+        draft = _draft_from_line(line)
+        if draft is not None:
+            drafts.append(draft)
+    return drafts
+
+
+def _draft_from_line(line: str) -> StepDraft | None:
+    """
+    Parse one numbered line. Other lines are not steps.
+
+    :param line: one line as str. Example: "1. List chapter files"
+    :return: draft or None as StepDraft | None. Example: StepDraft(1, "List chapter files")
+    """
+    match = _NUMBERED_STEP.match(line.strip())
+    if match is None:
+        return None
+    order = int(match.group(1))
+    if order < _MIN_STEP_ORDER:
+        return None
+    return StepDraft(order, match.group(2))
