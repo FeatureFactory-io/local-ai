@@ -3,9 +3,20 @@
 import logging
 import re
 import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
 
 from local_ai.blackboard.pins import Blackboard
-from local_ai.contracts import MAX_IDENTICAL_FAILURES, MAX_ROUNDS_PER_STEP, Completion, StepDraft
+from local_ai.contracts import (
+    MAX_IDENTICAL_FAILURES,
+    MAX_ROUNDS_PER_STEP,
+    AccessGrant,
+    Completion,
+    ReasoningNote,
+    StepDraft,
+    TaskPin,
+    ToolEnvelope,
+)
 from local_ai.llm.port import LlmPort, split_note
 from local_ai.plan.steps import PlanStore
 from local_ai.prompt.assemble import PromptAssembler
@@ -54,6 +65,10 @@ class Worker:
         self._plan = plan
         self._blackboard = blackboard
         self._connection = connection
+        self._last_envelope: ToolEnvelope | None = None
+        self._last_command: str | None = None
+        self._round_had_shell = False
+        self.trace: list[dict[str, str]] = []
 
     def run_task(self, task_id: str) -> str:
         """
@@ -96,13 +111,16 @@ class Worker:
         :param prompt: assembled prompt as str. Example: "Foundation\\nShell\\nTask"
         :param model_name: logical size as str. Example: "qwen-14b"
         :return: the model turn as Completion. Example: Completion(final_answer="Found ch-01.md")
+        :raises ValueError: when task_id, order, or model_name is unusable. Example: ""
+        :raises TypeError: when prompt is not a str. Example: None
         """
-        # Call LlmPort.complete.
-        # split_note. If the note is non-empty, Blackboard.append_reasoning.
-        # If the turn has a shell tool call, ShellTool.run and keep the envelope on the turn.
-        # Tool errors stay in the envelope. Do not raise them.
-        # Log worker.step acting with task_id, step, and tool=shell at INFO when the shell runs.
-        raise NotImplementedError
+        logger.info("Starting run_round task_id=%s step=%s", task_id, order)
+        _require_round_args(task_id, order, prompt, model_name)
+        completion = self._llm.complete(prompt, model_name)
+        self._append_note(task_id, order, completion)
+        self._run_requested_shell(task_id, order, completion)
+        logger.info("run_round finished task_id=%s step=%s", task_id, order)
+        return completion
 
     def run_step(self, task_id: str, order: int, model_name: str) -> str:
         """
@@ -170,9 +188,155 @@ class Worker:
         # Log the count at INFO. Do not log the command text beyond a short hash or length.
         raise NotImplementedError
 
+    def _append_note(self, task_id: str, order: int, completion: Completion) -> None:
+        """
+        Store a non-empty reasoning note on the pin.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :param completion: model turn as Completion. Example: Completion(thinking="Writing the marker.")
+        :return: None. Example: None
+        """
+        note = split_note(completion)
+        if not note.strip():
+            logger.info("run_round note empty task_id=%s step=%s", task_id, order)
+            return
+        self._blackboard.append_reasoning(
+            self._connection,
+            task_id,
+            ReasoningNote(_utc_now(), order, note),
+        )
+
+    def _run_requested_shell(self, task_id: str, order: int, completion: Completion) -> None:
+        """
+        Run one shell command when the turn asks for it.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :param completion: model turn as Completion. Example: Completion(tool_calls=(ToolCall("shell", "printf marker"),))
+        :return: None. Example: None
+        """
+        command = _shell_command(completion)
+        self._round_had_shell = command is not None
+        if command is None:
+            return
+        self._execute_shell(task_id, order, command)
+
+    def _execute_shell(self, task_id: str, order: int, command: str) -> None:
+        """
+        Run the command in the job directory and keep the envelope.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :param command: shell command as str. Example: "printf marker"
+        :return: None. Example: None
+        """
+        pin = self._require_pin(task_id)
+        job_dir = _job_dir(self._connection, task_id)
+        envelope = self._shell.run(_shell_grant(pin, job_dir), command, job_dir)
+        self._last_envelope = envelope
+        self._last_command = command
+        self.trace.append({"tool": "shell"})
+        logger.info("worker.step | acting | task_id=%s step=%s tool=shell", task_id, order)
+
+    def _require_pin(self, task_id: str) -> TaskPin:
+        """
+        Load the pin or reject a missing id.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :return: pin as TaskPin. Example: a pin with status "running"
+        :raises ValueError: when the pin is missing. Example: "missing-id"
+        """
+        pin = self._blackboard.get_pin(self._connection, task_id)
+        if pin is None:
+            raise ValueError(f"pin not found task_id={task_id}")
+        return pin
+
 
 _ROUNDS = MAX_ROUNDS_PER_STEP
 _IDENTICAL = MAX_IDENTICAL_FAILURES
+
+
+def _require_round_args(task_id: str, order: int, prompt: str, model_name: str) -> None:
+    """
+    Reject a round the model and the shell cannot run.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param order: step order as int. Example: 2
+    :param prompt: assembled prompt as str. Example: "Foundation\\nShell\\nTask"
+    :param model_name: logical size as str. Example: "qwen-14b"
+    :return: None. Example: None
+    :raises ValueError: when task_id, order, or model_name is unusable. Example: ""
+    :raises TypeError: when prompt is not a str. Example: None
+    """
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError("task_id must be a non-empty str. Example: '7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f'")
+    if isinstance(order, bool) or not isinstance(order, int) or order < _MIN_STEP_ORDER:
+        raise ValueError("order must be an int >= 1. Example: 2")
+    if not isinstance(prompt, str):
+        raise TypeError("prompt must be str. Example: 'Foundation\\nShell\\nTask'")
+    if not isinstance(model_name, str) or not model_name:
+        raise ValueError("model_name must be a non-empty str. Example: 'qwen-14b'")
+
+
+def _shell_command(completion: Completion) -> str | None:
+    """
+    Return the first shell command on the turn.
+
+    :param completion: model turn as Completion. Example: Completion(tool_calls=(ToolCall("shell", "printf marker"),))
+    :return: command or None as str | None. Example: "printf marker"
+    """
+    for call in completion.tool_calls:
+        if call.name == "shell":
+            return call.command
+    return None
+
+
+def _shell_grant(pin: TaskPin, job_dir: Path) -> AccessGrant:
+    """
+    Use the job directory as the root when the pin grant is job.
+
+    :param pin: live pin as TaskPin. Example: a pin with access mode job
+    :param job_dir: job folder as Path. Example: Path("data/jobs/7c1e0a2e")
+    :return: grant as AccessGrant. Example: AccessGrant(mode="job", paths=("data/jobs/7c1e0a2e",))
+    """
+    if pin.access.mode == "job":
+        return AccessGrant(mode="job", paths=(str(job_dir),))
+    return pin.access
+
+
+def _job_dir(connection: sqlite3.Connection, task_id: str) -> Path:
+    """
+    Place the job next to the sqlite file, under jobs/task_id.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: job directory as Path. Example: Path("data/jobs/7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+    """
+    return _database_file(connection).parent / "jobs" / task_id
+
+
+def _database_file(connection: sqlite3.Connection) -> Path:
+    """
+    Read the main sqlite file path from the open connection.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :return: database path as Path. Example: Path("data/local-ai.sqlite")
+    :raises ValueError: when sqlite has no file path. Example: an unnamed connection
+    """
+    row = connection.execute("PRAGMA database_list").fetchone()
+    if row is None or not row[2]:
+        raise ValueError("sqlite database path is missing")
+    return Path(str(row[2]))
+
+
+def _utc_now() -> str:
+    """
+    Return the current UTC time as a timestamp string.
+
+    :return: timestamp as str. Example: "2026-10-04T18:40:01Z"
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _drafts_from_completion(completion: Completion) -> list[StepDraft]:

@@ -1,12 +1,14 @@
 """Worker loop against a real sqlite file, a real shell, and ScriptedLLM."""
 
+import json
+import logging
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from local_ai.blackboard.pins import Blackboard
-from local_ai.contracts import AccessGrant, Completion, StepDraft, TaskPin
+from local_ai.contracts import AccessGrant, Completion, StepDraft, TaskPin, ToolCall, ToolEnvelope
 from local_ai.db.database import Database
 from local_ai.llm.port import ScriptedLLM
 from local_ai.plan.steps import PlanStore
@@ -14,6 +16,7 @@ from local_ai.prompt.assemble import PromptAssembler
 from local_ai.tools.grant import GrantChecker
 from local_ai.tools.shell import ShellTool
 from local_ai.worker.loop import Worker
+from tests.support.log_story import assert_log_story
 
 
 _TASK_ID = "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
@@ -50,6 +53,53 @@ def test_parse_plan_with_empty_completion_raises(tmp_path: Path) -> None:
         worker.parse_plan(Completion())
 
 
+def test_run_round_appends_note_runs_shell_and_logs_acting(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A note is stored, the shell runs, and the acting line names the shell."""
+    command = "python3 -c \"open('marker.txt','w').write('marker')\""
+    turn = Completion(thinking="Writing the marker.", tool_calls=(ToolCall("shell", command),))
+    worker, connection, job_dir = _open_worker(tmp_path, (turn,))
+    caplog.set_level(logging.INFO)
+
+    returned = worker.run_round(_TASK_ID, 1, "Foundation\nShell\nTask", "qwen-14b")
+
+    assert returned == turn
+    assert worker._last_envelope == ToolEnvelope(success=True, result="", error="")
+    assert (job_dir / "marker.txt").read_text(encoding="utf-8") == "marker"
+    assert json.loads(_reasoning(connection))[-1]["text"] == "Writing the marker."
+    assert_log_story(
+        caplog.records,
+        "worker.step",
+        "acting",
+        [f"task_id={_TASK_ID}", "step=1", "tool=shell"],
+    )
+
+
+def test_run_round_with_empty_note_does_not_append(tmp_path: Path) -> None:
+    """An empty note leaves the reasoning column untouched."""
+    turn = Completion(tool_calls=(ToolCall("shell", "printf marker"),))
+    worker, connection, job_dir = _open_worker(tmp_path, (turn,))
+
+    worker.run_round(_TASK_ID, 1, "Foundation\nShell\nTask", "qwen-14b")
+
+    assert _reasoning(connection) == "[]"
+    assert (job_dir / "shell.log").read_text(encoding="utf-8") == "marker"
+
+
+def test_run_round_with_failing_shell_keeps_the_envelope(tmp_path: Path) -> None:
+    """A non-zero exit stays in the envelope and does not raise."""
+    command = "python3 -c \"import sys; sys.stderr.write('boom'); raise SystemExit(4)\""
+    turn = Completion(thinking="Running the check.", tool_calls=(ToolCall("shell", command),))
+    worker, _connection, job_dir = _open_worker(tmp_path, (turn,))
+
+    worker.run_round(_TASK_ID, 2, "Foundation\nShell\nTask", "qwen-14b")
+
+    assert worker._last_envelope == ToolEnvelope(success=False, result="", error="boom")
+    assert (job_dir / "shell.log").read_text(encoding="utf-8") == "boom"
+
+
 def _open_worker(
     tmp_path: Path,
     script: tuple[Completion, ...],
@@ -77,6 +127,18 @@ def _open_worker(
         connection,
     )
     return worker, connection, job_dir
+
+
+def _reasoning(connection: sqlite3.Connection) -> str:
+    """
+    Return the stored reasoning column.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :return: reasoning JSON as str. Example: "[]"
+    """
+    row = connection.execute("SELECT reasoning FROM tasks WHERE id = ?", (_TASK_ID,)).fetchone()
+    assert row is not None
+    return str(row["reasoning"])
 
 
 def _pin() -> TaskPin:
