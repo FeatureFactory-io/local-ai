@@ -4,8 +4,14 @@ import logging
 import os
 import sqlite3
 from collections.abc import Mapping
+from typing import TypeVar
 
-from local_ai.capacity.reader import CapacityReader
+from local_ai.capacity.reader import (
+    CapacityReader,
+    HttpReader,
+    MemoryReader,
+    PressureReader,
+)
 from local_ai.dispatcher.service import DispatcherService
 from local_ai.dispatcher.slot import Slot
 from local_ai.worker.loop import Worker
@@ -14,6 +20,7 @@ from local_ai.worker.loop import Worker
 logger = logging.getLogger(__name__)
 
 _HTTP_PORT_ENV = "LOCAL_AI_HTTP_PORT"
+_ReaderT = TypeVar("_ReaderT")
 
 # Worker is constructed in main and passed to Slot. Service does not import it.
 COMPOSER_WORKER = Worker
@@ -32,6 +39,11 @@ class LocalAiServer:
         slot: Slot,
         capacity: CapacityReader,
         connection: sqlite3.Connection,
+        *,
+        memory: MemoryReader | None = None,
+        ollama: HttpReader | None = None,
+        pressure: PressureReader | None = None,
+        ollama_host: str | None = None,
     ) -> None:
         """
         Store the wired objects. FastMCP registration happens in build.
@@ -40,11 +52,19 @@ class LocalAiServer:
         :param slot: worker slot as Slot. Example: Slot(service, worker, connection, clock)
         :param capacity: capacity reader as CapacityReader. Example: CapacityReader()
         :param connection: shared connection as sqlite3.Connection. Example: the Database connection
+        :param memory: returns (total_gb, free_gb) as MemoryReader | None. Example: lambda: (64.0, 40.2)
+        :param ollama: HTTP reader as HttpReader | None. Example: lambda path: (200, {"models": []})
+        :param pressure: pressure reader as PressureReader | None. Example: lambda: "normal"
+        :param ollama_host: base URL as str | None. Example: "http://127.0.0.1:11434"
         """
         self._service = service
         self._slot = slot
         self._capacity = capacity
         self._connection = connection
+        self._memory = memory
+        self._ollama = ollama
+        self._pressure = pressure
+        self._ollama_host = ollama_host
 
     def build(self):
         """
@@ -62,10 +82,21 @@ class LocalAiServer:
         Current machine load and a model-size recommendation.
 
         :return: capacity body as dict. Example: {"status": "ok", "ollama": "up", "recommended": "qwen-14b"}
+        :raises RuntimeError: when a reader or host was not stored. Example: memory=None
         """
-        # CapacityReader.read with the process memory reader, the Ollama HTTP reader, and OLLAMA_HOST.
-        # Log the tool name at INFO. There is no task_id yet.
-        raise NotImplementedError
+        logger.info("capacity | entry")
+        body = self._capacity.read(
+            _require_reader(self._memory, "memory", "lambda: (64.0, 40.2)"),
+            _require_reader(self._ollama, "ollama", "lambda path: (200, {'models': []})"),
+            _require_reader(self._pressure, "pressure", "lambda: 'normal'"),
+            _require_ollama_host(self._ollama_host),
+        )
+        logger.info(
+            "capacity | exit | ollama=%s recommended=%s",
+            body.get("ollama"),
+            body.get("recommended"),
+        )
+        return body
 
     def submit(
         self,
@@ -178,3 +209,31 @@ def _integer_port(raw: object) -> int:
         raise ValueError("LOCAL_AI_HTTP_PORT must be an integer. Example: 8765") from exc
     logger.info("http_port_from_env | port=%s", port)
     return port
+
+
+def _require_reader(reader: _ReaderT | None, name: str, example: str) -> _ReaderT:
+    """
+    Reject a missing probe before CapacityReader.read runs.
+
+    :param reader: injected probe as _ReaderT | None. Example: lambda: (64.0, 40.2)
+    :param name: probe name as str. Example: "memory"
+    :param example: usage hint as str. Example: "lambda: (64.0, 40.2)"
+    :return: the probe as _ReaderT. Example: lambda: (64.0, 40.2)
+    :raises RuntimeError: when the probe is missing. Example: memory=None
+    """
+    if not callable(reader):
+        raise RuntimeError(f"{name} reader is required. Example: {example}")
+    return reader
+
+
+def _require_ollama_host(host: str | None) -> str:
+    """
+    Reject a blank Ollama base URL.
+
+    :param host: base URL as str | None. Example: "http://127.0.0.1:11434"
+    :return: the same URL as str. Example: "http://127.0.0.1:11434"
+    :raises RuntimeError: when host is missing or blank. Example: None
+    """
+    if not isinstance(host, str) or not host.strip():
+        raise RuntimeError("ollama_host is required. Example: 'http://127.0.0.1:11434'")
+    return host
