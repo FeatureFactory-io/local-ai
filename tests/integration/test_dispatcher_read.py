@@ -9,7 +9,7 @@ import pytest
 
 from local_ai.blackboard.pins import Blackboard
 from local_ai.capacity.reader import CapacityReader
-from local_ai.contracts import AccessGrant, ReasoningNote, StepDraft, TaskPin
+from local_ai.contracts import AccessGrant, InvalidPriority, ReasoningNote, StepDraft, TaskPin
 from local_ai.db.database import Database
 from local_ai.dispatcher.service import DispatcherService
 from local_ai.plan.steps import PlanStore
@@ -17,6 +17,7 @@ from tests.support.log_story import assert_log_story
 
 
 _TASK_ID = "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+_OTHER_ID = "11111111-2222-4333-8444-555555555555"
 _GOAL = "Summarize the book into 2-3 pages, one thesis per chapter."
 _PLAN = (
     "1. List chapter files (completed). "
@@ -113,6 +114,116 @@ def test_read_pin_with_blank_task_id_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="task_id"):
         service.read_pin("  ", connection)
+
+
+def test_reprioritize_with_queued_pin_returns_the_new_position(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A queued pin stores the new priority and reports its place."""
+    service, connection, blackboard, _plan = _open(tmp_path)
+    blackboard.insert_pin(connection, _pin(status="queued", phase="queued", priority=40))
+    caplog.set_level(logging.INFO)
+
+    body = service.reprioritize(_TASK_ID, 5, connection)
+
+    assert body == _contract("reprioritize_queued.json")
+    assert _priority(connection, _TASK_ID) == 5
+    assert_log_story(
+        caplog.records,
+        "dispatcher.reprioritize",
+        "queued",
+        [f"task_id={_TASK_ID}", "priority=5", "position=1"],
+    )
+
+
+def test_reprioritize_with_a_pin_ahead_keeps_the_later_place(tmp_path: Path) -> None:
+    """A lower number jumps the queue. An equal priority stays behind the earlier pin."""
+    service, connection, blackboard, _plan = _open(tmp_path)
+    blackboard.insert_pin(
+        connection,
+        _pin(
+            status="queued",
+            phase="queued",
+            priority=10,
+            task_id=_OTHER_ID,
+            created_at="2026-10-04T18:39:00Z",
+            goal="Other.",
+        ),
+    )
+    blackboard.insert_pin(
+        connection,
+        _pin(status="queued", phase="queued", priority=80, created_at="2026-10-04T18:41:00Z"),
+    )
+
+    behind = service.reprioritize(_TASK_ID, 20, connection)
+    ahead = service.reprioritize(_TASK_ID, 5, connection)
+    tied = service.reprioritize(_TASK_ID, 10, connection)
+
+    assert behind == {"status": "queued", "task_id": _TASK_ID, "priority": 20, "position": 2}
+    assert ahead == {"status": "queued", "task_id": _TASK_ID, "priority": 5, "position": 1}
+    assert tied == {"status": "queued", "task_id": _TASK_ID, "priority": 10, "position": 2}
+    assert _priority(connection, _OTHER_ID) == 10
+    assert _priority(connection, _TASK_ID) == 10
+
+
+@pytest.mark.parametrize("status", ["running", "completed", "failed"])
+def test_reprioritize_with_unqueued_pin_does_not_write(
+    tmp_path: Path,
+    status: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Running, completed, and failed pins stay at their old priority."""
+    service, connection, blackboard, _plan = _open(tmp_path)
+    blackboard.insert_pin(connection, _pin(status=status, phase=status, priority=40))
+    caplog.set_level(logging.INFO)
+
+    body = service.reprioritize(_TASK_ID, 5, connection)
+
+    assert body == _contract("reprioritize_rejected.json")
+    assert _priority(connection, _TASK_ID) == 40
+    assert _status(connection, _TASK_ID) == status
+    assert_log_story(
+        caplog.records,
+        "dispatcher.reprioritize",
+        "not_queued",
+        [f"task_id={_TASK_ID}", f"status={status}"],
+    )
+
+
+def test_reprioritize_with_missing_pin_returns_not_found(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A missing pin is rejected and nothing is inserted."""
+    service, connection, _blackboard, _plan = _open(tmp_path)
+    caplog.set_level(logging.INFO)
+
+    body = service.reprioritize(_TASK_ID, 5, connection)
+
+    assert body == {"status": "rejected", "reason": "not_found", "task_id": _TASK_ID}
+    assert _task_count(connection) == 0
+    assert_log_story(
+        caplog.records,
+        "dispatcher.reprioritize",
+        "not_found",
+        [f"task_id={_TASK_ID}"],
+    )
+
+
+@pytest.mark.parametrize("priority", [0, 101])
+def test_reprioritize_with_priority_outside_range_does_not_write(
+    tmp_path: Path,
+    priority: int,
+) -> None:
+    """An illegal priority raises and leaves the queued pin unchanged."""
+    service, connection, blackboard, _plan = _open(tmp_path)
+    blackboard.insert_pin(connection, _pin(status="queued", phase="queued", priority=40))
+
+    with pytest.raises(InvalidPriority):
+        service.reprioritize(_TASK_ID, priority, connection)
+
+    assert _priority(connection, _TASK_ID) == 40
 
 
 def _open(
@@ -237,6 +348,42 @@ def _contract(name: str) -> dict:
     :return: parsed object as dict. Example: {"status": "running"}
     """
     return json.loads((_CONTRACTS / name).read_text(encoding="utf-8"))
+
+
+def _priority(connection: sqlite3.Connection, task_id: str) -> int:
+    """
+    Read one pin's priority.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: priority as int. Example: 40
+    """
+    return int(_task_column(connection, task_id, "priority"))
+
+
+def _status(connection: sqlite3.Connection, task_id: str) -> str:
+    """
+    Read one pin's status.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: status as str. Example: "queued"
+    """
+    return str(_task_column(connection, task_id, "status"))
+
+
+def _task_column(connection: sqlite3.Connection, task_id: str, column: str) -> object:
+    """
+    Read one tasks column.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param column: column name as str. Example: "priority"
+    :return: column value as object. Example: 40
+    """
+    row = connection.execute(f"SELECT {column} FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row is not None
+    return row[column]
 
 
 def _task_count(connection: sqlite3.Connection) -> int:

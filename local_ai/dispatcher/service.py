@@ -45,6 +45,7 @@ _REASON_OLLAMA_DOWN = "ollama_down"
 _REASON_MODEL_UNAVAILABLE = "model_unavailable"
 _STATUS_REJECTED = "rejected"
 _REASON_NOT_FOUND = "not_found"
+_REASON_NOT_QUEUED = "not_queued"
 
 
 class DispatcherService:
@@ -190,16 +191,22 @@ class DispatcherService:
         """
         Change priority of a queued pin.
 
+        Running, completed, and failed pins return status rejected and reason not_queued. The row is not written.
+        A missing pin returns reason not_found.
+
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param priority: new priority as int. Example: 5
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
-        :return: queued or rejected body as dict. Example: {"status": "queued", "priority": 5, "position": 1}
+        :return: queued or rejected body as dict. Example: {"status": "queued", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", "priority": 5, "position": 1}
+        :raises InvalidPriority: when priority is outside 1..100. Example: 0
+        :raises TypeError: when connection is not a Connection. Example: None
+        :raises ValueError: when task_id is blank. Example: "  "
         """
-        # validate_priority. Blackboard.get_pin.
-        # status running, completed, or failed returns rejected, reason not_queued, and does not write.
-        # status queued calls Blackboard.update_priority and queue_position.
-        # Log the branch at INFO.
-        raise NotImplementedError
+        checked = validate_priority(priority)
+        pin = self._blackboard.get_pin(connection, task_id)
+        if pin is None or pin.status != _STATUS_QUEUED:
+            return _reject_reprioritize(pin, task_id)
+        return _apply_queued_priority(self._blackboard, connection, pin, checked)
 
     def claim_next(self, connection: sqlite3.Connection, started_at: str) -> TaskPin | None:
         """
@@ -619,6 +626,56 @@ def _note_body(note: ReasoningNote) -> dict:
     :return: note object as dict. Example: {"at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md."}
     """
     return {"at": note.at, "step": note.step, "text": note.text}
+
+
+def _reject_reprioritize(pin: TaskPin | None, task_id: str) -> dict:
+    """
+    Reject a pin that is missing or not queued. Neither branch writes.
+
+    :param pin: loaded pin as TaskPin | None. Example: None
+    :param task_id: requested pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: rejected body as dict. Example: {"status": "rejected", "reason": "not_queued", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"}
+    """
+    if pin is None:
+        logger.info("dispatcher.reprioritize | not_found | task_id=%s", task_id)
+        return _rejected_task(task_id, _REASON_NOT_FOUND)
+    logger.info(
+        "dispatcher.reprioritize | not_queued | task_id=%s status=%s",
+        task_id,
+        pin.status,
+    )
+    return _rejected_task(task_id, _REASON_NOT_QUEUED)
+
+
+def _apply_queued_priority(
+    blackboard: Blackboard,
+    connection: sqlite3.Connection,
+    pin: TaskPin,
+    priority: int,
+) -> dict:
+    """
+    Store a new priority and report the pin's place among queued pins.
+
+    :param blackboard: pin store as Blackboard. Example: Blackboard(database)
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param pin: queued pin as TaskPin. Example: a pin with status "queued"
+    :param priority: new priority as int. Example: 5
+    :return: queued body as dict. Example: {"status": "queued", "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", "priority": 5, "position": 1}
+    """
+    blackboard.update_priority(connection, pin.task_id, priority)
+    position = queue_position(replace(pin, priority=priority), blackboard.list_queued(connection))
+    logger.info(
+        "dispatcher.reprioritize | queued | task_id=%s priority=%s position=%s",
+        pin.task_id,
+        priority,
+        position,
+    )
+    return {
+        "status": _STATUS_QUEUED,
+        "task_id": pin.task_id,
+        "priority": priority,
+        "position": position,
+    }
 
 
 def _log_read(task_id: str, status: str) -> None:
