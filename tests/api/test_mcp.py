@@ -139,6 +139,33 @@ def test_submit_when_ollama_is_down_returns_rejected_without_kick(
     assert not any(record.message == "Starting kick" for record in caplog.records)
 
 
+def test_read_returns_the_pin_body(tmp_path: Path) -> None:
+    """read returns the read_pin body. Keys match the running example."""
+    server = _server(tmp_path, script=_HOLD_SCRIPT)
+    try:
+        queued = server.submit("Write a brief.", "brief.md exists", priority=40, model="qwen-14b")
+        body = server.read(str(queued["task_id"]))
+    finally:
+        _join_slot(server)
+
+    assert set(body) == set(_contract("read_running.json"))
+    assert body["status"] == "running"
+    assert body["task_id"] == queued["task_id"]
+    assert body["goal"] == "Write a brief."
+    assert body["model"] == "qwen-14b"
+
+
+def test_read_missing_pin_returns_not_found(tmp_path: Path) -> None:
+    """A missing id is a rejected dict, not an exception."""
+    server = _server(tmp_path)
+
+    body = server.read("7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+
+    assert body["status"] == "rejected"
+    assert body["reason"] == "not_found"
+    assert body["task_id"] == "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+
+
 class _CountingReader(CapacityReader):
     """Real CapacityReader that counts read calls."""
 

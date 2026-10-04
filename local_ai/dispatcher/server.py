@@ -138,9 +138,13 @@ class LocalAiServer:
 
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :return: pin body as dict. Example: {"status": "running", "phase": "acting"}
+        :raises ValueError: when task_id is blank. Example: "  "
         """
-        # DispatcherService.read_pin.
-        raise NotImplementedError
+        logger.info("read | entry")
+        _require_text(task_id, "task_id", "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+        body = self._service.read_pin(task_id, self._connection)
+        logger.info("read | exit | status=%s", body.get("status"))
+        return body
 
     def reprioritize(self, task_id: str, priority: int) -> dict:
         """
