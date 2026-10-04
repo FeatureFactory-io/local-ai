@@ -86,6 +86,72 @@ class PromptAssembler:
         :param plan_text: readable plan as str. Example: ""
         :param prior_synthesis: previous synthesis as str. Example: ""
         :return: task block as str. Example: "Goal: Turn the notes into a one-page brief."
+        :raises TypeError: when an argument has the wrong type. Example: grant={"mode": "job"}
         """
-        # Include goal, done_when, inputs, the grant object, plan_text, and prior_synthesis.
-        raise NotImplementedError
+        self._validate_task_inputs(goal, done_when, grant, inputs, plan_text, prior_synthesis)
+        logger.info(
+            f"PromptAssembler._task grant_mode={grant.mode} "
+            f"input_count={len(inputs)} prior_synthesis_empty={prior_synthesis == ''}"
+        )
+        return _format_task(goal, done_when, grant, inputs, plan_text, prior_synthesis)
+
+    def _validate_task_inputs(
+        self,
+        goal: str,
+        done_when: str,
+        grant: AccessGrant,
+        inputs: tuple[str, ...],
+        plan_text: str,
+        prior_synthesis: str,
+    ) -> None:
+        """
+        Reject arguments that are not the pin fields the task layer prints.
+
+        :param goal: task goal as str. Example: "Turn the notes into a one-page brief."
+        :param done_when: completion condition as str. Example: "brief.md exists"
+        :param grant: access grant as AccessGrant. Example: AccessGrant(mode="home")
+        :param inputs: input paths as tuple[str, ...]. Example: ("/Users/denispetelin/books/draft",)
+        :param plan_text: readable plan as str. Example: ""
+        :param prior_synthesis: previous synthesis as str. Example: ""
+        :return: None. Example: None
+        :raises TypeError: when an argument has the wrong type. Example: grant={"mode": "job"}
+        """
+        if not isinstance(goal, str) or not isinstance(done_when, str):
+            raise TypeError("goal and done_when must be str")
+        if not isinstance(grant, AccessGrant):
+            raise TypeError(f"grant must be AccessGrant, got {type(grant).__name__}")
+        if not isinstance(inputs, tuple) or any(not isinstance(item, str) for item in inputs):
+            raise TypeError("inputs must be tuple[str, ...]")
+        if not isinstance(plan_text, str) or not isinstance(prior_synthesis, str):
+            raise TypeError("plan_text and prior_synthesis must be str")
+
+
+def _format_task(
+    goal: str,
+    done_when: str,
+    grant: AccessGrant,
+    inputs: tuple[str, ...],
+    plan_text: str,
+    prior_synthesis: str,
+) -> str:
+    """
+    Render the pin fields, including the grant object's repr.
+
+    :param goal: task goal as str. Example: "Turn the notes into a one-page brief."
+    :param done_when: completion condition as str. Example: "brief.md exists"
+    :param grant: access grant as AccessGrant. Example: AccessGrant(mode="home")
+    :param inputs: input paths as tuple[str, ...]. Example: ("/Users/denispetelin/books/draft",)
+    :param plan_text: readable plan as str. Example: ""
+    :param prior_synthesis: previous synthesis as str. Example: ""
+    :return: task block as str. Example: "Goal: Turn the notes into a one-page brief."
+    """
+    return "\n".join(
+        (
+            f"Goal: {goal}",
+            f"Done when: {done_when}",
+            f"Inputs: {inputs!r}",
+            f"Grant: {grant!r}",
+            f"Plan: {plan_text}",
+            f"Prior synthesis: {prior_synthesis}",
+        )
+    )
