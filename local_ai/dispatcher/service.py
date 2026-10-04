@@ -40,6 +40,7 @@ _GRANT_MODES = ("job", "paths", "home")
 _JOB_MODE = "job"
 _STATUS_QUEUED = "queued"
 _STATUS_RUNNING = "running"
+_STATUS_FAILED = "failed"
 _PHASE_QUEUED = "queued"
 _REASON_OLLAMA_DOWN = "ollama_down"
 _REASON_MODEL_UNAVAILABLE = "model_unavailable"
@@ -255,6 +256,8 @@ class DispatcherService:
         """
         Write the terminal status and release the pin.
 
+        A failed status cancels pending steps. A completed status leaves them.
+
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param status: completed or failed as str. Example: "failed"
         :param error: failure summary as str. Example: "three identical shell failures"
@@ -262,10 +265,12 @@ class DispatcherService:
         :param finished_at: stop time as str. Example: "2026-10-04T18:55:00Z"
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :return: None. Example: None
+        :raises TypeError: when connection, error, or artifacts has the wrong type. Example: "/tmp/summary.md"
+        :raises ValueError: when status is not completed or failed, or the pin is missing. Example: "running"
         """
-        # Blackboard.set_final. PlanStore.cancel_pending when status is failed.
-        # Log dispatcher.finish with task_id, status, and the artifact count at INFO.
-        raise NotImplementedError
+        self._blackboard.set_final(connection, task_id, status, error, artifacts, finished_at)
+        _cancel_pending_on_failure(self._plan, connection, task_id, status)
+        _log_finish(task_id, status, len(artifacts))
 
 
 def _require_grant_mode(grant_mode: str) -> None:
@@ -679,6 +684,44 @@ def _apply_queued_priority(
         "priority": priority,
         "position": position,
     }
+
+
+def _cancel_pending_on_failure(
+    plan: PlanStore,
+    connection: sqlite3.Connection,
+    task_id: str,
+    status: str,
+) -> None:
+    """
+    Cancel open steps only when the pin failed, then commit that update.
+
+    :param plan: step store as PlanStore. Example: PlanStore(database)
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param status: completed or failed as str. Example: "failed"
+    :return: None. Example: None
+    """
+    if status != _STATUS_FAILED:
+        return
+    plan.cancel_pending(connection, task_id)
+    connection.commit()
+
+
+def _log_finish(task_id: str, status: str, artifact_count: int) -> None:
+    """
+    Log the terminal finish on one INFO line.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param status: completed or failed as str. Example: "completed"
+    :param artifact_count: number of output paths as int. Example: 2
+    :return: None. Example: None
+    """
+    logger.info(
+        "dispatcher.finish | exit | task_id=%s status=%s artifacts=%s",
+        task_id,
+        status,
+        artifact_count,
+    )
 
 
 def _log_recovered(task_ids: tuple[str, ...]) -> None:

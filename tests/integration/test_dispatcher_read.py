@@ -25,6 +25,7 @@ _PLAN = (
     "2. Write a thesis per chapter (running). "
     "3. Assemble summary.md (pending)."
 )
+_FINISHED_AT = "2026-10-04T18:55:00Z"
 _NOTE = (
     "Reading ch-04.md. The claim is in the last section. "
     "I will append one paragraph to theses.md."
@@ -306,6 +307,97 @@ def test_recover_running_with_a_bad_connection_raises(tmp_path: Path) -> None:
         service.recover_running(None)  # type: ignore[arg-type]
 
 
+def test_finish_with_completed_status_keeps_pending_steps(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A completed finish writes the pin and leaves pending steps pending."""
+    service, connection, blackboard, plan = _open(tmp_path)
+    _seed_finish_steps(connection, blackboard, plan)
+    caplog.set_level(logging.INFO)
+
+    service.finish(_TASK_ID, "completed", "", ("/tmp/summary.md",), _FINISHED_AT, connection)
+
+    assert _status(connection, _TASK_ID) == "completed"
+    assert _step_rows(connection, _TASK_ID) == [
+        (1, "completed", ""),
+        (2, "running", ""),
+        (3, "pending", ""),
+    ]
+    body = service.read_pin(_TASK_ID, connection)
+    assert body["status"] == "completed"
+    assert body["error"] == ""
+    assert body["artifacts"] == ["/tmp/summary.md"]
+    assert_log_story(
+        caplog.records,
+        "dispatcher.finish",
+        "exit",
+        [f"task_id={_TASK_ID}", "status=completed", "artifacts=1"],
+    )
+
+
+def test_finish_with_failed_status_cancels_pending_steps(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed finish stores the error and cancels only the open steps."""
+    service, connection, blackboard, plan = _open(tmp_path)
+    _seed_finish_steps(connection, blackboard, plan)
+    caplog.set_level(logging.INFO)
+
+    service.finish(
+        _TASK_ID,
+        "failed",
+        "three identical shell failures",
+        (),
+        _FINISHED_AT,
+        connection,
+    )
+
+    fresh = _reopen(tmp_path)
+    assert _status(fresh, _TASK_ID) == "failed"
+    assert _step_rows(fresh, _TASK_ID) == [
+        (1, "completed", ""),
+        (2, "running", ""),
+        (3, "failed", "cancelled"),
+    ]
+    body = service.read_pin(_TASK_ID, connection)
+    assert body["status"] == "failed"
+    assert body["error"] == "three identical shell failures"
+    assert body["artifacts"] == []
+    assert_log_story(
+        caplog.records,
+        "dispatcher.finish",
+        "exit",
+        [f"task_id={_TASK_ID}", "status=failed", "artifacts=0"],
+    )
+
+
+def test_finish_with_running_status_does_not_write(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-terminal status raises and leaves the pin and its steps alone."""
+    service, connection, blackboard, plan = _open(tmp_path)
+    _seed_finish_steps(connection, blackboard, plan)
+    caplog.set_level(logging.INFO)
+
+    with pytest.raises(ValueError, match="status"):
+        service.finish(_TASK_ID, "running", "", (), _FINISHED_AT, connection)
+
+    assert _status(connection, _TASK_ID) == "running"
+    assert _step_rows(connection, _TASK_ID)[2] == (3, "pending", "")
+    assert not any("dispatcher.finish" in record.getMessage() for record in caplog.records)
+
+
+def test_finish_with_missing_pin_raises(tmp_path: Path) -> None:
+    """A missing pin is not finished."""
+    service, connection, _blackboard, _plan = _open(tmp_path)
+
+    with pytest.raises(ValueError, match="pin not found"):
+        service.finish(_TASK_ID, "failed", "missing", (), _FINISHED_AT, connection)
+
+
 def _open(
     tmp_path: Path,
 ) -> tuple[DispatcherService, sqlite3.Connection, Blackboard, PlanStore]:
@@ -353,6 +445,37 @@ def _seed_running_contract(
             reasoning=(ReasoningNote("2026-10-04T18:40:01Z", 2, _NOTE),),
             started_at="2026-10-04T18:40:02Z",
         ),
+    )
+    plan.insert_steps(
+        connection,
+        _TASK_ID,
+        (
+            StepDraft(1, "List chapter files"),
+            StepDraft(2, "Write a thesis per chapter"),
+            StepDraft(3, "Assemble summary.md"),
+        ),
+    )
+    plan.mark_running(connection, _TASK_ID, 1)
+    plan.complete_step(connection, _TASK_ID, 1, "Found ch-01.md through ch-12.md", "")
+    plan.mark_running(connection, _TASK_ID, 2)
+
+
+def _seed_finish_steps(
+    connection: sqlite3.Connection,
+    blackboard: Blackboard,
+    plan: PlanStore,
+) -> None:
+    """
+    Store a running pin with one completed step, one running step, and one pending step.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param blackboard: pin store as Blackboard. Example: Blackboard(database)
+    :param plan: step store as PlanStore. Example: PlanStore(database)
+    :return: None. Example: None
+    """
+    blackboard.insert_pin(
+        connection,
+        _pin(status="running", phase="acting", started_at="2026-10-04T18:40:02Z"),
     )
     plan.insert_steps(
         connection,
@@ -454,6 +577,36 @@ def _contract(name: str) -> dict:
     :return: parsed object as dict. Example: {"status": "running"}
     """
     return json.loads((_CONTRACTS / name).read_text(encoding="utf-8"))
+
+
+def _reopen(tmp_path: Path) -> sqlite3.Connection:
+    """
+    Open a second connection so only committed rows are visible.
+
+    :param tmp_path: pytest temp directory as Path. Example: Path("/tmp/pytest")
+    :return: connection as sqlite3.Connection. Example: the Database connection
+    """
+    return Database(tmp_path / "local-ai.sqlite").connect()
+
+
+def _step_rows(connection: sqlite3.Connection, task_id: str) -> list[tuple[int, str, str]]:
+    """
+    Read step order, status, and error.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: rows as list[tuple[int, str, str]]. Example: [(1, "completed", "")]
+    """
+    rows = connection.execute(
+        """
+        SELECT step_order, status, error
+        FROM plan_steps
+        WHERE task_id = ?
+        ORDER BY step_order
+        """,
+        (task_id,),
+    ).fetchall()
+    return [(int(row["step_order"]), str(row["status"]), str(row["error"])) for row in rows]
 
 
 def _priority(connection: sqlite3.Connection, task_id: str) -> int:
