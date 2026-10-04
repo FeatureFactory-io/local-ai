@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 
 from local_ai.blackboard.pins import Blackboard
 from local_ai.capacity.reader import CapacityReader
+from local_ai.contracts import Completion, ToolCall
 from local_ai.db.database import Database
 from local_ai.dispatcher.server import LocalAiServer, http_port_from_env
 from local_ai.dispatcher.service import DispatcherService
@@ -25,6 +27,12 @@ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "contracts"
 _HOST = "http://127.0.0.1:11434"
 _TAGS = f"{_HOST}/api/tags"
 _PS = f"{_HOST}/api/ps"
+_JOIN_TIMEOUT_S = 5.0
+_HOLD_COMMAND = "python3 -c \"import time; time.sleep(2)\""
+_HOLD_SCRIPT = (
+    Completion(content="1. Pause in the job folder"),
+    Completion(tool_calls=(ToolCall("shell", _HOLD_COMMAND),), final_answer="Paused"),
+)
 
 Http = Callable[[str], tuple[int, dict]]
 Memory = Callable[[], tuple[float, float]]
@@ -98,6 +106,39 @@ def test_capacity_when_tags_fail_returns_the_down_body(tmp_path: Path) -> None:
     assert calls == [_TAGS]
 
 
+def test_submit_returns_the_queued_snapshot_after_kick_claims(tmp_path: Path) -> None:
+    """The tool returns status queued. kick has already claimed the pin, so a later read is running."""
+    server = _server(tmp_path, script=_HOLD_SCRIPT)
+    try:
+        body = server.submit("Write a brief.", "brief.md exists", priority=40, model="qwen-14b")
+        live = server._service.read_pin(str(body["task_id"]), server._connection)
+    finally:
+        _join_slot(server)
+
+    assert set(body) == set(_contract("submit_queued.json"))
+    assert body["status"] == "queued"
+    assert body["priority"] == 40
+    assert body["model"] == "qwen-14b"
+    assert body["position"] == 1
+    assert live["status"] == "running"
+
+
+def test_submit_when_ollama_is_down_returns_rejected_without_kick(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A down daemon returns the rejected dict and does not call Slot.kick."""
+    ollama, _calls = _scripted_ollama(tags_status=503, loaded_model=None)
+    server = _server(tmp_path, ollama=ollama)
+    caplog.set_level(logging.INFO)
+
+    body = server.submit("Write a brief.", "brief.md exists", priority=40, model="qwen-14b")
+
+    assert set(body) == set(_contract("submit_rejected.json"))
+    assert body == {"status": "rejected", "reason": "ollama_down", "task_id": None}
+    assert not any(record.message == "Starting kick" for record in caplog.records)
+
+
 class _CountingReader(CapacityReader):
     """Real CapacityReader that counts read calls."""
 
@@ -132,6 +173,7 @@ def _server(
     memory: Memory | None = None,
     ollama: Http | None = None,
     pressure: Pressure | None = None,
+    script: tuple[Completion, ...] = (),
 ) -> LocalAiServer:
     """
     Wire a server on a temp database. Readers are the only stand-ins.
@@ -141,6 +183,7 @@ def _server(
     :param memory: gigabyte probe as Memory | None. Example: lambda: (64.0, 40.2)
     :param ollama: HTTP reader as Http | None. Example: lambda path: (200, {"models": []})
     :param pressure: pressure word as Pressure | None. Example: lambda: "normal"
+    :param script: model turns as tuple[Completion, ...]. Example: ()
     :return: server as LocalAiServer. Example: LocalAiServer(...)
     """
     database = Database(tmp_path / "local-ai.sqlite")
@@ -163,7 +206,7 @@ def _server(
         pressure=words,
         ollama_host=_HOST,
     )
-    worker = Worker(ScriptedLLM(()), ShellTool(GrantChecker()), PromptAssembler(), plan, board, connection)
+    worker = Worker(ScriptedLLM(script), ShellTool(GrantChecker()), PromptAssembler(), plan, board, connection)
     slot = Slot(service, worker, connection, lambda: "2026-10-04T18:40:02Z")
     return LocalAiServer(
         service,
@@ -197,6 +240,23 @@ def _scripted_ollama(tags_status: int, loaded_model: str | None) -> tuple[Http, 
         raise AssertionError(url)
 
     return ollama, calls
+
+
+def _join_slot(server: LocalAiServer, timeout: float = _JOIN_TIMEOUT_S) -> None:
+    """
+    Wait until the slot thread stops so the temp job can be removed.
+
+    :param server: server under test as LocalAiServer. Example: the server from _server
+    :param timeout: seconds to wait as float. Example: 5.0
+    :return: None. Example: None
+    """
+    thread = server._slot._thread
+    if thread is None:
+        return
+    deadline = time.monotonic() + timeout
+    thread.join(timeout=timeout)
+    if thread.is_alive() and time.monotonic() >= deadline:
+        return
 
 
 def _contract(name: str) -> dict:

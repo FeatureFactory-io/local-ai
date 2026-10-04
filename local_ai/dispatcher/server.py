@@ -12,6 +12,7 @@ from local_ai.capacity.reader import (
     MemoryReader,
     PressureReader,
 )
+from local_ai.contracts import SubmitRequest
 from local_ai.dispatcher.service import DispatcherService
 from local_ai.dispatcher.slot import Slot
 from local_ai.worker.loop import Worker
@@ -20,6 +21,7 @@ from local_ai.worker.loop import Worker
 logger = logging.getLogger(__name__)
 
 _HTTP_PORT_ENV = "LOCAL_AI_HTTP_PORT"
+_STATUS_QUEUED = "queued"
 _ReaderT = TypeVar("_ReaderT")
 
 # Worker is constructed in main and passed to Slot. Service does not import it.
@@ -117,11 +119,18 @@ class LocalAiServer:
         :param inputs: files to copy as list[str] | None. Example: []
         :param access: grant object or omitted as dict | None. Example: {"mode": "job"}
         :return: queued or rejected body as dict. Example: {"status": "queued", "position": 1}
+        :raises ValueError: when goal or done_when is blank. Example: ""
+        :raises TypeError: when inputs is not a list of strings. Example: "notes.md"
         """
-        # Build SubmitRequest. DispatcherService.submit returns the queued snapshot.
-        # Then Slot.kick. The returned dict stays the snapshot from before the claim.
-        # Log the tool name at INFO.
-        raise NotImplementedError
+        logger.info("submit | entry")
+        snapshot = self._service.submit(
+            _submit_request(goal, done_when, priority, model, inputs, access),
+            self._connection,
+        )
+        if snapshot.get("status") == _STATUS_QUEUED:
+            self._slot.kick()
+        logger.info("submit | exit | status=%s", snapshot.get("status"))
+        return snapshot
 
     def read(self, task_id: str) -> dict:
         """
@@ -209,6 +218,64 @@ def _integer_port(raw: object) -> int:
         raise ValueError("LOCAL_AI_HTTP_PORT must be an integer. Example: 8765") from exc
     logger.info("http_port_from_env | port=%s", port)
     return port
+
+
+def _submit_request(
+    goal: str,
+    done_when: str,
+    priority: int | None,
+    model: str | None,
+    inputs: list[str] | None,
+    access: dict | None,
+) -> SubmitRequest:
+    """
+    Build the request the dispatcher accepts.
+
+    :param goal: worker goal as str. Example: "Summarize the book into 2-3 pages."
+    :param done_when: completion condition as str. Example: "summary.md exists"
+    :param priority: 1..100 or omitted as int | None. Example: 40
+    :param model: qwen size or omitted as str | None. Example: "qwen-14b"
+    :param inputs: files to copy as list[str] | None. Example: []
+    :param access: grant object or omitted as dict | None. Example: {"mode": "job"}
+    :return: request as SubmitRequest. Example: SubmitRequest("Write a brief.", "brief.md exists")
+    :raises ValueError: when goal or done_when is blank. Example: ""
+    :raises TypeError: when inputs is not a list of strings. Example: "notes.md"
+    """
+    _require_text(goal, "goal", "Summarize the book into 2-3 pages.")
+    _require_text(done_when, "done_when", "summary.md exists")
+    return SubmitRequest(goal, done_when, priority, model, _input_paths(inputs), access)
+
+
+def _require_text(value: object, name: str, example: str) -> None:
+    """
+    Reject a blank string before the dispatcher sees it.
+
+    :param value: candidate text as object. Example: "Write a brief."
+    :param name: field name as str. Example: "goal"
+    :param example: usage hint as str. Example: "Summarize the book into 2-3 pages."
+    :return: None. Example: None
+    :raises ValueError: when value is blank or not a string. Example: ""
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty str. Example: {example!r}")
+
+
+def _input_paths(inputs: list[str] | None) -> tuple[str, ...]:
+    """
+    Copy the input list into the tuple SubmitRequest stores.
+
+    :param inputs: files to copy as list[str] | None. Example: []
+    :return: paths as tuple[str, ...]. Example: ()
+    :raises TypeError: when inputs is not a list of strings. Example: "notes.md"
+    """
+    if inputs is None:
+        return ()
+    if isinstance(inputs, str) or not isinstance(inputs, (list, tuple)):
+        raise TypeError("inputs must be a list of paths. Example: []")
+    paths = tuple(inputs)
+    if any(not isinstance(path, str) for path in paths):
+        raise TypeError("inputs must be a list of paths. Example: []")
+    return paths
 
 
 def _require_reader(reader: _ReaderT | None, name: str, example: str) -> _ReaderT:
