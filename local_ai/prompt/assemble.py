@@ -42,12 +42,14 @@ class PromptAssembler:
         :param inputs: input paths as tuple[str, ...]. Example: ()
         :param plan_text: readable plan as str. Example: "1. List chapter files (pending)."
         :param prior_synthesis: previous step handoff as str. Example: "Found ch-01.md through ch-12.md"
-        :return: prompt as str. Example: "Foundation\\nShell\\nTask"
+        :return: prompt as str. Example: "You are the local worker for one task.\\n\\npython3, curl, pandoc, weasyprint, and mmdc are on PATH.\\n\\nGoal: Turn the notes into a one-page brief."
+        :raises TypeError: when an argument has the wrong type. Example: grant={"mode": "job"}
         """
-        # Call _foundation, then _shell_brief, then _task.
-        # Join the three blocks with a blank line.
-        # Log the grant mode and whether prior_synthesis is empty at INFO. Do not log the goal body.
-        raise NotImplementedError
+        self._validate_task_inputs(goal, done_when, grant, inputs, plan_text, prior_synthesis)
+        empty_prior = prior_synthesis == ""
+        logger.info(f"PromptAssembler.assemble grant_mode={grant.mode} prior_synthesis_empty={empty_prior}")
+        task = self._task(goal, done_when, grant, inputs, plan_text, prior_synthesis)
+        return "\n\n".join((self._foundation(), self._shell_brief(), task))
 
     def _foundation(self) -> str:
         """
