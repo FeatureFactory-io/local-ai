@@ -1,0 +1,8 @@
+{
+  "status": "queued",
+  "task_id": "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f",
+  "priority": 40,
+  "model": "qwen-14b",
+  "position": 2,
+  "access": { "mode": "paths", "paths": ["/Users/denispetelin/books/draft"] }
+}

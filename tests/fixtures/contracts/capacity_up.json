@@ -1,0 +1,10 @@
+{
+  "status": "ok",
+  "memory_total_gb": 64.0,
+  "memory_free_gb": 40.2,
+  "memory_pressure": "normal",
+  "ollama": "up",
+  "loaded_model": "qwen2.5:14b",
+  "recommended": "qwen-14b",
+  "models": ["qwen-8b", "qwen-14b", "qwen-24b"]
+}

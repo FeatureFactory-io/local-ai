@@ -1,0 +1,8 @@
+{
+  "goal": "Summarize the book into 2-3 pages, one thesis per chapter.",
+  "done_when": "data/jobs/<task_id>/summary.md exists and covers every chapter file.",
+  "priority": 40,
+  "model": "qwen-14b",
+  "inputs": ["/Users/denispetelin/books/draft"],
+  "access": { "mode": "paths", "paths": ["/Users/denispetelin/books/draft"] }
+}

@@ -8,6 +8,12 @@ from local_ai.contracts import Completion, ScriptExhausted
 
 logger = logging.getLogger(__name__)
 
+MODEL_ENV_KEYS = {
+    "qwen-8b": "LOCAL_AI_MODEL_8B",
+    "qwen-14b": "LOCAL_AI_MODEL_14B",
+    "qwen-24b": "LOCAL_AI_MODEL_24B",
+}
+
 
 class LlmPort:
     """Interface the worker calls. LiteLLMAdapter and ScriptedLLM both implement it."""
@@ -185,6 +191,45 @@ def resolve_model_tag(model_name: str, env: Mapping[str, str]) -> str:
     :return: Ollama tag as str. Example: "qwen2.5:14b"
     :raises KeyError: when the matching LOCAL_AI_MODEL_* variable is missing. Example: "qwen-14b" with an empty env
     """
-    # qwen-8b reads LOCAL_AI_MODEL_8B. qwen-14b reads LOCAL_AI_MODEL_14B. qwen-24b reads LOCAL_AI_MODEL_24B.
-    # Log the logical name at INFO. Do not log secrets. There is no API key.
-    raise NotImplementedError
+    logger.info("Starting resolve_model_tag model_name=%s", model_name)
+    env_key = _env_key_for_model(model_name)
+    tag = _tag_from_env(env, env_key)
+    logger.info("resolve_model_tag model_name=%s env_key=%s", model_name, env_key)
+    return tag
+
+
+def _env_key_for_model(model_name: str) -> str:
+    """
+    Choose the environment variable for a logical model name.
+
+    :param model_name: logical size as str. Example: "qwen-14b"
+    :return: environment variable name as str. Example: "LOCAL_AI_MODEL_14B"
+    :raises KeyError: when model_name is not one of the three sizes. Example: "gpt-4"
+    :raises ValueError: when model_name is empty. Example: ""
+    """
+    if not isinstance(model_name, str) or not model_name:
+        raise ValueError("model_name must be a non-empty str. Example: 'qwen-14b'")
+    try:
+        return MODEL_ENV_KEYS[model_name]
+    except KeyError:
+        raise KeyError(model_name) from None
+
+
+def _tag_from_env(env: Mapping[str, str], env_key: str) -> str:
+    """
+    Read one Ollama tag. The value is not logged.
+
+    :param env: environment as Mapping[str, str]. Example: {"LOCAL_AI_MODEL_14B": "qwen2.5:14b"}
+    :param env_key: variable name as str. Example: "LOCAL_AI_MODEL_14B"
+    :return: Ollama tag as str. Example: "qwen2.5:14b"
+    :raises KeyError: when env_key is absent. Example: "LOCAL_AI_MODEL_14B"
+    """
+    if not isinstance(env, Mapping):
+        raise TypeError("env must be a mapping. Example: {'LOCAL_AI_MODEL_14B': 'qwen2.5:14b'}")
+    try:
+        tag = env[env_key]
+    except KeyError:
+        raise KeyError(env_key) from None
+    if not isinstance(tag, str) or not tag:
+        raise ValueError(f"{env_key} must be a non-empty str. Example: 'qwen2.5:14b'")
+    return tag

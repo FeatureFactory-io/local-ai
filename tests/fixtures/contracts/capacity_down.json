@@ -1,0 +1,10 @@
+{
+  "status": "ok",
+  "memory_total_gb": 64.0,
+  "memory_free_gb": 40.2,
+  "memory_pressure": "normal",
+  "ollama": "down",
+  "loaded_model": null,
+  "recommended": "none",
+  "models": []
+}

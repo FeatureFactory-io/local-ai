@@ -5,7 +5,7 @@ import logging
 import pytest
 
 from local_ai.contracts import Completion, ScriptExhausted
-from local_ai.llm.port import LiteLLMAdapter, ScriptedLLM, split_note
+from local_ai.llm.port import LiteLLMAdapter, ScriptedLLM, resolve_model_tag, split_note
 
 
 def test_scripted_llm_complete_returns_turns_in_order_then_raises() -> None:
@@ -93,3 +93,37 @@ def test_split_note_logs_source_and_not_the_note_text(caplog: pytest.LogCaptureF
     messages = "\n".join(record.message for record in caplog.records if record.levelno == logging.INFO)
     assert "source=thinking" in messages
     assert "SECRET-NOTE-BODY" not in messages
+
+
+@pytest.mark.parametrize(
+    ("model_name", "env_key", "tag"),
+    [
+        ("qwen-8b", "LOCAL_AI_MODEL_8B", "qwen2.5:8b"),
+        ("qwen-14b", "LOCAL_AI_MODEL_14B", "qwen2.5:14b"),
+        ("qwen-24b", "LOCAL_AI_MODEL_24B", "qwen2.5:24b"),
+    ],
+)
+def test_resolve_model_tag_reads_the_matching_env_key(model_name: str, env_key: str, tag: str) -> None:
+    """Each logical size reads only its LOCAL_AI_MODEL_* variable."""
+    assert resolve_model_tag(model_name, {env_key: tag, "OTHER": "ignored"}) == tag
+
+
+def test_resolve_model_tag_missing_key_raises_key_error() -> None:
+    """A missing LOCAL_AI_MODEL_* variable is a KeyError, as the docstring says."""
+    with pytest.raises(KeyError):
+        resolve_model_tag("qwen-14b", {})
+
+
+def test_resolve_model_tag_does_not_use_a_different_size_key() -> None:
+    """LOCAL_AI_MODEL_8B does not satisfy a qwen-24b request."""
+    with pytest.raises(KeyError):
+        resolve_model_tag("qwen-24b", {"LOCAL_AI_MODEL_8B": "qwen2.5:8b"})
+
+
+def test_resolve_model_tag_logs_logical_name_not_the_tag(caplog: pytest.LogCaptureFixture) -> None:
+    """INFO names the logical model. The Ollama tag stays off the log."""
+    caplog.set_level(logging.INFO, logger="local_ai.llm.port")
+    resolve_model_tag("qwen-14b", {"LOCAL_AI_MODEL_14B": "SECRET-TAG-VALUE"})
+    messages = "\n".join(record.message for record in caplog.records if record.levelno == logging.INFO)
+    assert "qwen-14b" in messages
+    assert "SECRET-TAG-VALUE" not in messages
