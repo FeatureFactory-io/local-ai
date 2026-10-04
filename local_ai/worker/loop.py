@@ -30,6 +30,10 @@ from local_ai.tools.shell import ShellTool
 logger = logging.getLogger(__name__)
 
 _NUMBERED_STEP = re.compile(r"^(\d+)\.\s+(\S.*?)\s*$")
+_NAMED_OUTPUT = re.compile(r"\b[\w][\w.-]*\.(?:md|txt|py|pdf)\b")
+_TEXT_SUFFIXES = frozenset({".md", ".txt", ".py"})
+_COMMAND_CLIP = 180
+_NOTE_CLIP = 400
 _MIN_STEP_ORDER = 1
 
 
@@ -95,6 +99,7 @@ class Worker:
             self.failure_reason = "empty_plan"
             return "failed"
         outcome = self._run_pending_steps(task_id, self._require_pin(task_id).model)
+        outcome = self._reject_if_result_missing(task_id, outcome)
         logger.info("worker.task | finished | task_id=%s status=%s", task_id, outcome)
         return outcome
 
@@ -257,6 +262,7 @@ class Worker:
         self._last_envelope = envelope
         self._step_envelope = envelope
         self._last_command = command
+        self._record_shell_note(task_id, order, command, envelope)
         self.trace.append({"tool": "shell"})
         logger.info("worker.step | acting | task_id=%s step=%s tool=shell", task_id, order)
 
@@ -364,6 +370,49 @@ class Worker:
         if phase == "planning":
             self.trace.append({"workflow": "planning"})
 
+    def _refresh_plan(self, task_id: str) -> None:
+        """
+        Rewrite current_plan from the step rows without changing the phase.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :return: None. Example: None
+        """
+        self._publish_phase(task_id, self._require_pin(task_id).phase)
+
+    def _record_shell_note(self, task_id: str, order: int, command: str, envelope: ToolEnvelope) -> None:
+        """
+        Put the command and its output on the pin.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 1
+        :param command: shell command as str. Example: "pdftotext book.pdf -"
+        :param envelope: shell result as ToolEnvelope. Example: ToolEnvelope(False, None, "missing pdf")
+        :return: None. Example: None
+        """
+        self._blackboard.append_reasoning(
+            self._connection,
+            task_id,
+            ReasoningNote(_utc_now(), order, _shell_note(order, command, envelope)),
+        )
+
+    def _reject_if_result_missing(self, task_id: str, outcome: str) -> str:
+        """
+        Fail a completed run when a file named in done_when is missing or blank.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param outcome: step-loop status as str. Example: "completed"
+        :return: status as str. Example: "failed"
+        """
+        if outcome != "completed":
+            return outcome
+        missing = _missing_named_output(self._require_pin(task_id).done_when, _job_dir(self._connection, task_id))
+        if not missing:
+            return outcome
+        self.failure_reason = missing
+        self._blackboard.append_reasoning(self._connection, task_id, ReasoningNote(_utc_now(), 0, missing))
+        logger.info("worker.task | result missing | task_id=%s", task_id)
+        return "failed"
+
     def _complete_open_step(self, task_id: str, order: int, synthesis: str) -> str:
         """
         Store the handoff and record the completed step.
@@ -380,6 +429,7 @@ class Worker:
             synthesis,
             _envelope_json(self._step_envelope),
         )
+        self._refresh_plan(task_id)
         self.trace.append({"effect": "step_completed"})
         logger.info("worker.step | completed | task_id=%s step=%s", task_id, order)
         return "completed"
@@ -397,6 +447,7 @@ class Worker:
         if _shell_failed(self._round_had_shell, self._last_envelope) and self._last_command is not None:
             self._failed_command = self._last_command
             self._failed_error = error
+        self._refresh_plan(task_id)
         logger.info("worker.step | failed | task_id=%s step=%s", task_id, order)
         return "failed"
 
@@ -619,6 +670,78 @@ def _require_adapt_args(task_id: str, order: int, model_name: str, error: str) -
     _require_step_args(task_id, order, model_name)
     if not isinstance(error, str):
         raise TypeError("error must be str. Example: 'weasyprint: CSS path missing'")
+
+
+def _shell_note(order: int, command: str, envelope: ToolEnvelope) -> str:
+    """
+    Format one shell outcome so a read of the pin shows what ran.
+
+    :param order: step order as int. Example: 1
+    :param command: shell command as str. Example: "pdftotext book.pdf -"
+    :param envelope: shell result as ToolEnvelope. Example: ToolEnvelope(False, None, "missing pdf")
+    :return: note text as str. Example: "step 1 failed: pdftotext book.pdf -\\nmissing pdf"
+    """
+    head = _clip(command.strip(), _COMMAND_CLIP)
+    if envelope.success:
+        body = f"step {order}: {head}\nexit 0\n{envelope.result or ''}"
+    else:
+        body = f"step {order} failed: {head}\n{envelope.error}"
+    return _clip(body.strip(), _NOTE_CLIP)
+
+
+def _clip(text: str, limit: int) -> str:
+    """
+    Keep a note short enough to read on the pin.
+
+    :param text: raw text as str. Example: "missing pdf"
+    :param limit: max characters as int. Example: 400
+    :return: clipped text as str. Example: "missing pdf"
+    """
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _missing_named_output(done_when: str, job_dir: Path) -> str:
+    """
+    Name the first done_when file that is absent or blank.
+
+    :param done_when: completion text as str. Example: "marker.txt exists"
+    :param job_dir: job directory as Path. Example: Path("/tmp/jobs/id")
+    :return: failure text or empty as str. Example: "marker.txt is missing or empty"
+    """
+    for name in _named_outputs(done_when):
+        if _output_missing(job_dir / name):
+            return f"{name} is missing or empty"
+    return ""
+
+
+def _named_outputs(done_when: str) -> tuple[str, ...]:
+    """
+    Pull file names out of a done_when sentence.
+
+    :param done_when: completion text as str. Example: "summary.md exists in the job folder"
+    :return: names as tuple[str, ...]. Example: ("summary.md",)
+    """
+    seen: list[str] = []
+    for name in _NAMED_OUTPUT.findall(done_when):
+        if name not in seen:
+            seen.append(name)
+    return tuple(seen)
+
+
+def _output_missing(path: Path) -> bool:
+    """
+    True when the promised file is absent, zero-length, or only whitespace.
+
+    :param path: file in the job directory as Path. Example: Path("/tmp/jobs/id/marker.txt")
+    :return: missing as bool. Example: True
+    """
+    if not path.is_file() or path.stat().st_size == 0:
+        return True
+    if path.suffix.lower() not in _TEXT_SUFFIXES:
+        return False
+    return path.read_text(encoding="utf-8").strip() == ""
 
 
 def _replacement_action(completion: Completion, worker: Worker) -> str | None:

@@ -31,7 +31,10 @@ _JOIN_TIMEOUT_S = 5
 _PAUSE_S = "0.6"
 _COMPLETE_TURN = (
     Completion(content="1. Finish the brief"),
-    Completion(final_answer="The brief is done"),
+    Completion(
+        tool_calls=(ToolCall("shell", "python3 -c \"open('brief.md','w').write('brief\\n')\""),),
+        final_answer="The brief is done",
+    ),
 )
 _PAUSE_TURN = (
     Completion(content="1. Pause in the job folder"),

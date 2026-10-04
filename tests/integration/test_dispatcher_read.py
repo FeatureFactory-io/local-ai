@@ -74,6 +74,20 @@ def test_read_pin_with_running_pin_matches_the_contract(
     )
 
 
+def test_read_pin_returns_the_step_error(tmp_path: Path) -> None:
+    """A failed step's error is part of the pin the caller reads."""
+    service, connection, blackboard, plan = _open(tmp_path)
+    blackboard.insert_pin(connection, _pin(status="running", phase="acting"))
+    plan.insert_steps(connection, _TASK_ID, (StepDraft(1, "Extract the pdf"),))
+    plan.mark_running(connection, _TASK_ID, 1)
+    plan.fail_step(connection, _TASK_ID, 1, "missing pdf")
+
+    body = service.read_pin(_TASK_ID, connection)
+
+    assert body["steps"][0]["error"] == "missing pdf"
+    assert body["steps"][0]["status"] == "failed"
+
+
 def test_read_pin_with_no_steps_returns_empty_steps_and_job_access(tmp_path: Path) -> None:
     """A pin with no plan still returns the pin keys and an empty step list."""
     service, connection, blackboard, _plan = _open(tmp_path)

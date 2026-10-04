@@ -84,7 +84,9 @@ def test_run_round_appends_note_runs_shell_and_logs_acting(
     assert returned == turn
     assert worker._last_envelope == ToolEnvelope(success=True, result="", error="")
     assert (job_dir / "marker.txt").read_text(encoding="utf-8") == "marker"
-    assert json.loads(_reasoning(connection))[-1]["text"] == "Writing the marker."
+    texts = [item["text"] for item in json.loads(_reasoning(connection))]
+    assert "Writing the marker." in texts
+    assert any("exit 0" in text and "python3" in text for text in texts)
     assert_log_story(
         caplog.records,
         "worker.step",
@@ -93,14 +95,17 @@ def test_run_round_appends_note_runs_shell_and_logs_acting(
     )
 
 
-def test_run_round_with_empty_note_does_not_append(tmp_path: Path) -> None:
-    """An empty note leaves the reasoning column untouched."""
+def test_run_round_with_empty_note_records_the_shell(tmp_path: Path) -> None:
+    """An empty model note adds no model text. The shell outcome is still on the pin."""
     turn = Completion(tool_calls=(ToolCall("shell", "printf marker"),))
     worker, connection, job_dir = _open_worker(tmp_path, (turn,))
 
     worker.run_round(_TASK_ID, 1, "Foundation\nShell\nTask", "qwen-14b")
 
-    assert _reasoning(connection) == "[]"
+    notes = json.loads(_reasoning(connection))
+    assert len(notes) == 1
+    assert "printf marker" in notes[0]["text"]
+    assert "exit 0" in notes[0]["text"]
     assert (job_dir / "shell.log").read_text(encoding="utf-8") == "marker"
 
 
@@ -327,22 +332,22 @@ def test_run_task_with_empty_plan_returns_failed(tmp_path: Path) -> None:
 
 def test_run_task_with_shell_tool_and_no_numbered_plan_runs_that_command(tmp_path: Path) -> None:
     """A planning turn that is only a shell call writes the file and completes."""
-    command = "python3 -c \"open('poem.md','w').write('python\\n')\""
+    command = "python3 -c \"open('marker.txt','w').write('python\\n')\""
     worker, connection, job_dir = _open_worker(
         tmp_path,
-        (Completion(thinking="Writing poem.md.", tool_calls=(ToolCall("shell", command),)),),
+        (Completion(thinking="Writing marker.txt.", tool_calls=(ToolCall("shell", command),)),),
     )
 
     outcome = worker.run_task(_TASK_ID)
 
     assert outcome == "completed"
-    assert (job_dir / "poem.md").read_text(encoding="utf-8") == "python\n"
+    assert (job_dir / "marker.txt").read_text(encoding="utf-8") == "python\n"
     assert [(step.order, step.status) for step in _steps(worker, connection)] == [(1, "completed")]
 
 
 def test_run_task_retries_when_the_recovery_turn_is_a_shell_command(tmp_path: Path) -> None:
     """A failed command is replaced by the shell call on the recovery turn."""
-    good = "python3 -c \"open('poem.md','w').write('python\\n')\""
+    good = "python3 -c \"open('marker.txt','w').write('python\\n')\""
     worker, connection, job_dir = _open_worker(
         tmp_path,
         (
@@ -354,7 +359,78 @@ def test_run_task_retries_when_the_recovery_turn_is_a_shell_command(tmp_path: Pa
     outcome = worker.run_task(_TASK_ID)
 
     assert outcome == "completed"
-    assert (job_dir / "poem.md").read_text(encoding="utf-8") == "python\n"
+    assert (job_dir / "marker.txt").read_text(encoding="utf-8") == "python\n"
+    assert [(step.order, step.status) for step in _steps(worker, connection)] == [
+        (1, "failed"),
+        (2, "completed"),
+    ]
+
+
+def test_failed_shell_is_written_on_the_pin(tmp_path: Path) -> None:
+    """A failed command is on the pin: the plan says failed, and the note has the output."""
+    command = "python3 -c \"import sys; sys.stderr.write('missing pdf\\n'); raise SystemExit(1)\""
+    worker, connection, _job_dir = _open_worker(
+        tmp_path,
+        (
+            Completion(tool_calls=(ToolCall("shell", command),)),
+            Completion(),
+        ),
+    )
+
+    outcome = worker.run_task(_TASK_ID)
+
+    pin = worker._blackboard.get_pin(connection, _TASK_ID)
+    assert pin is not None
+    notes = " ".join(note.text for note in pin.reasoning)
+    assert outcome == "failed"
+    assert "(failed)" in pin.current_plan
+    assert "missing pdf" in notes
+    assert "python3" in notes
+    assert "missing pdf" in worker.failure_reason
+
+
+def test_run_task_fails_when_the_named_result_is_missing(tmp_path: Path) -> None:
+    """A successful command that never writes marker.txt does not complete the pin."""
+    worker, connection, job_dir = _open_worker(
+        tmp_path,
+        (
+            Completion(content="1. Touch a different file"),
+            Completion(tool_calls=(ToolCall("shell", "touch other.txt"),), final_answer="touched other.txt"),
+        ),
+    )
+
+    outcome = worker.run_task(_TASK_ID)
+
+    pin = worker._blackboard.get_pin(connection, _TASK_ID)
+    assert pin is not None
+    assert outcome == "failed"
+    assert "marker.txt" in worker.failure_reason
+    assert (job_dir / "other.txt").is_file()
+    assert not (job_dir / "marker.txt").exists()
+    assert any("marker.txt" in note.text for note in pin.reasoning)
+    assert "(completed)" in pin.current_plan
+
+
+def test_run_task_fails_when_the_named_result_is_blank(tmp_path: Path) -> None:
+    """A file that exists but has no text does not complete the pin."""
+    command = "python3 -c \"open('marker.txt','w').write('   \\n')\""
+    worker, connection, job_dir = _open_worker(
+        tmp_path,
+        (
+            Completion(content="1. Write the marker"),
+            Completion(tool_calls=(ToolCall("shell", command),), final_answer="wrote the marker"),
+        ),
+    )
+
+    outcome = worker.run_task(_TASK_ID)
+
+    pin = worker._blackboard.get_pin(connection, _TASK_ID)
+    assert pin is not None
+    assert outcome == "failed"
+    assert "marker.txt" in worker.failure_reason
+    assert "empty" in worker.failure_reason
+    assert (job_dir / "marker.txt").is_file()
+    assert any("marker.txt" in note.text for note in pin.reasoning)
 
 
 def test_run_task_stops_on_third_identical_failure(tmp_path: Path) -> None:

@@ -8,9 +8,9 @@
   "access": { "mode": "paths", "paths": ["/Users/denispetelin/books/draft"] },
   "current_plan": "1. List chapter files (completed). 2. Write a thesis per chapter (running). 3. Assemble summary.md (pending).",
   "steps": [
-    { "order": 1, "action": "List chapter files", "status": "completed", "llm_synthesis": "Found ch-01.md through ch-12.md" },
-    { "order": 2, "action": "Write a thesis per chapter", "status": "running", "llm_synthesis": "" },
-    { "order": 3, "action": "Assemble summary.md", "status": "pending", "llm_synthesis": "" }
+    { "order": 1, "action": "List chapter files", "status": "completed", "llm_synthesis": "Found ch-01.md through ch-12.md", "error": "" },
+    { "order": 2, "action": "Write a thesis per chapter", "status": "running", "llm_synthesis": "", "error": "" },
+    { "order": 3, "action": "Assemble summary.md", "status": "pending", "llm_synthesis": "", "error": "" }
   ],
   "reasoning": [
     { "at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md. The claim is in the last section. I will append one paragraph to theses.md." }

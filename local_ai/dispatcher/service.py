@@ -616,13 +616,14 @@ def _step_body(step: PlanStep) -> dict:
     Map one step onto the read contract keys.
 
     :param step: one step as PlanStep. Example: PlanStep("7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", 1, "List chapter files", "completed")
-    :return: step object as dict. Example: {"order": 1, "action": "List chapter files", "status": "completed", "llm_synthesis": ""}
+    :return: step object as dict. Example: {"order": 1, "action": "List chapter files", "status": "completed", "llm_synthesis": "", "error": ""}
     """
     return {
         "order": step.order,
         "action": step.action,
         "status": step.status,
         "llm_synthesis": step.llm_synthesis,
+        "error": step.error,
     }
 
 

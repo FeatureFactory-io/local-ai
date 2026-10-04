@@ -177,7 +177,7 @@ A running pin is not reordered. `reprioritize` applies to `queued` pins.
 | `action` | What this step is for, in one sentence |
 | `status` | `pending`, `running`, `completed`, `failed`, `waiting_retry` |
 | `result_json` | Tool envelope or parsed output |
-| `error` | Step error text |
+| `error` | Why the step failed. Empty when it has not failed. `read` returns this with the step |
 | `llm_synthesis` | What the next step must know |
 
 Completed steps stay completed if the task resumes.
@@ -210,6 +210,10 @@ Fixed keys, durability tier B (the row survives a process restart). Reasoning ca
 | `artifacts` | Output paths |
 | `error` | Set when status becomes `failed` |
 | `final_status` | `completed` or `failed`, written by the dispatcher when the worker slot is released |
+
+Each shell command appends one reasoning note: the command, the exit, and a short excerpt of stdout or stderr. `current_plan` is rewritten when a step completes or fails, so `read` shows the same status as the step row, and that step's `error`.
+
+`completed` requires every file named in `done_when` (`.md`, `.txt`, `.py`, `.pdf`) to exist in the job directory. A text file that is empty or only whitespace does not count. A missing or blank file fails the pin. `error` and a reasoning note name that file.
 
 ## 5. Test Strategy
 
@@ -544,9 +548,9 @@ Response while the worker is on the second step:
   "access": { "mode": "paths", "paths": ["/Users/denispetelin/books/draft"] },
   "current_plan": "1. List chapter files (completed). 2. Write a thesis per chapter (running). 3. Assemble summary.md (pending).",
   "steps": [
-    { "order": 1, "action": "List chapter files", "status": "completed", "llm_synthesis": "Found ch-01.md through ch-12.md" },
-    { "order": 2, "action": "Write a thesis per chapter", "status": "running", "llm_synthesis": "" },
-    { "order": 3, "action": "Assemble summary.md", "status": "pending", "llm_synthesis": "" }
+    { "order": 1, "action": "List chapter files", "status": "completed", "llm_synthesis": "Found ch-01.md through ch-12.md", "error": "" },
+    { "order": 2, "action": "Write a thesis per chapter", "status": "running", "llm_synthesis": "", "error": "" },
+    { "order": 3, "action": "Assemble summary.md", "status": "pending", "llm_synthesis": "", "error": "" }
   ],
   "reasoning": [
     { "at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md. The claim is in the last section. I will append one paragraph to theses.md." }
