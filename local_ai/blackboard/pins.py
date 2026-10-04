@@ -1,9 +1,22 @@
 """Pin rows. Worker appends reasoning. DispatcherService reads and finishes pins."""
 
+import json
+import logging
 import sqlite3
 
-from local_ai.contracts import ReasoningNote, TaskPin
+from local_ai.contracts import AccessGrant, ReasoningNote, TaskPin
 from local_ai.db.database import Database
+
+
+logger = logging.getLogger(__name__)
+
+_INSERT_PIN_SQL = """
+INSERT INTO tasks (
+    id, priority, status, model, goal, done_when, access_json, phase,
+    current_plan, reasoning, artifacts_json, error, created_at, started_at,
+    finished_at, final_status
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
 
 
 class Blackboard:
@@ -32,10 +45,19 @@ class Blackboard:
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :param pin: new pin as TaskPin. Example: a pin with status "queued" and phase "queued"
         :return: None. Example: None
+        :raises TypeError: when connection or pin has the wrong type. Example: None
+        :raises ValueError: when task_id is blank. Example: "  "
         """
-        # Insert the tasks row. Store access as JSON and reasoning as "[]".
-        # Log blackboard.insert with task_id, priority, and model at INFO.
-        raise NotImplementedError
+        _require_connection(connection)
+        _require_pin(pin)
+        connection.execute(_INSERT_PIN_SQL, _insert_parameters(pin))
+        connection.commit()
+        logger.info(
+            "blackboard.insert | task_id=%s | priority=%s | model=%s",
+            pin.task_id,
+            pin.priority,
+            pin.model,
+        )
 
     def get_pin(self, connection: sqlite3.Connection, task_id: str) -> TaskPin | None:
         """
@@ -157,3 +179,130 @@ class Blackboard:
         # SELECT status='queued' ORDER BY priority ASC, created_at ASC.
         # Log the count at INFO.
         raise NotImplementedError
+
+
+def _require_connection(connection: sqlite3.Connection) -> None:
+    """
+    Reject a value that is not an open sqlite connection.
+
+    :param connection: candidate connection as sqlite3.Connection. Example: the Database connection
+    :return: None. Example: None
+    :raises TypeError: when connection is not a Connection. Example: None
+    """
+    if not isinstance(connection, sqlite3.Connection):
+        raise TypeError("connection must be sqlite3.Connection. Example: the Database connection")
+
+
+def _require_pin(pin: TaskPin) -> None:
+    """
+    Reject a pin that cannot be stored as a tasks row.
+
+    :param pin: candidate pin as TaskPin. Example: a pin with status "queued"
+    :return: None. Example: None
+    :raises TypeError: when pin or its access is the wrong type. Example: {}
+    :raises ValueError: when task_id is blank. Example: "  "
+    """
+    if not isinstance(pin, TaskPin):
+        raise TypeError("pin must be TaskPin. Example: a pin with status 'queued'")
+    _require_task_id(pin.task_id)
+    if not isinstance(pin.access, AccessGrant):
+        raise TypeError("pin.access must be AccessGrant. Example: AccessGrant('job')")
+
+
+def _require_task_id(task_id: str) -> None:
+    """
+    Reject a blank pin id.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: None. Example: None
+    :raises ValueError: when task_id is blank. Example: "  "
+    """
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError(
+            "task_id must be a non-empty string. Example: '7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f'"
+        )
+
+
+def _insert_parameters(pin: TaskPin) -> tuple[object, ...]:
+    """
+    Map a pin onto the tasks insert columns.
+
+    :param pin: new pin as TaskPin. Example: a pin with status "queued"
+    :return: bound values as tuple. Example: ("7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f", 40, "queued")
+    """
+    return (
+        pin.task_id,
+        pin.priority,
+        pin.status,
+        pin.model,
+        pin.goal,
+        pin.done_when,
+        _dump_access(pin.access),
+        pin.phase,
+        pin.current_plan,
+        _dump_notes(pin.reasoning),
+        _dump_artifacts(pin.artifacts),
+        pin.error,
+        pin.created_at,
+        pin.started_at,
+        pin.finished_at,
+        pin.final_status,
+    )
+
+
+def _dump_access(access: AccessGrant) -> str:
+    """
+    Encode a grant as JSON. Paths are omitted when the grant has none.
+
+    :param access: grant as AccessGrant. Example: AccessGrant("job")
+    :return: JSON object as str. Example: '{"mode": "job"}'
+    """
+    payload: dict[str, object] = {"mode": access.mode}
+    if access.paths:
+        payload["paths"] = list(access.paths)
+    return json.dumps(payload)
+
+
+def _dump_notes(notes: tuple[ReasoningNote, ...]) -> str:
+    """
+    Encode reasoning notes as a JSON array.
+
+    :param notes: notes as tuple[ReasoningNote, ...]. Example: ()
+    :return: JSON array as str. Example: "[]"
+    :raises TypeError: when notes is not a tuple of ReasoningNote. Example: []
+    """
+    if not isinstance(notes, tuple):
+        raise TypeError("reasoning must be a tuple of ReasoningNote. Example: ()")
+    payload = [_note_payload(note) for note in notes]
+    return json.dumps(payload)
+
+
+def _note_payload(note: ReasoningNote) -> dict[str, object]:
+    """
+    Encode one note as at, step, and text.
+
+    :param note: one note as ReasoningNote. Example: ReasoningNote("2026-10-04T18:40:01Z", 2, "Reading ch-04.md.")
+    :return: note object as dict. Example: {"at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md."}
+    :raises TypeError: when note is not a ReasoningNote. Example: "Reading ch-04.md."
+    """
+    if not isinstance(note, ReasoningNote):
+        raise TypeError(
+            "reasoning entry must be ReasoningNote. "
+            "Example: ReasoningNote('2026-10-04T18:40:01Z', 2, 'Reading ch-04.md.')"
+        )
+    return {"at": note.at, "step": note.step, "text": note.text}
+
+
+def _dump_artifacts(artifacts: tuple[str, ...]) -> str:
+    """
+    Encode artifact paths as a JSON array.
+
+    :param artifacts: paths as tuple[str, ...]. Example: ("/tmp/summary.md",)
+    :return: JSON array as str. Example: '["/tmp/summary.md"]'
+    :raises TypeError: when artifacts is not a tuple of strings. Example: "/tmp/summary.md"
+    """
+    if isinstance(artifacts, (str, bytes)) or not isinstance(artifacts, tuple):
+        raise TypeError("artifacts must be a tuple of strings. Example: ('/tmp/summary.md',)")
+    if any(not isinstance(path, str) for path in artifacts):
+        raise TypeError("artifacts must be a tuple of strings. Example: ('/tmp/summary.md',)")
+    return json.dumps(list(artifacts))
