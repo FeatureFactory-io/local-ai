@@ -15,6 +15,7 @@ _STATUS_FAILED = "failed"
 _STATUS_WAITING_RETRY = "waiting_retry"
 _MARK_RUNNING_SOURCES = frozenset({_STATUS_PENDING, _STATUS_WAITING_RETRY})
 _SHIFTABLE_STATUSES = frozenset({_STATUS_PENDING, _STATUS_WAITING_RETRY})
+_CANCELLED_ERROR = "cancelled"
 _MIN_STEP_ORDER = 1
 
 
@@ -167,15 +168,18 @@ class PlanStore:
 
     def cancel_pending(self, connection: sqlite3.Connection, task_id: str) -> int:
         """
-        Cancel every still-pending step. Completed and failed rows stay.
+        Cancel every pending or waiting_retry step. Completed, failed, and running rows stay.
 
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :return: number cancelled as int. Example: 1
+        :raises ValueError: when task_id is blank. Example: ""
         """
-        # Set pending and waiting_retry rows to failed with error "cancelled".
-        # Log task_id and the count at INFO.
-        raise NotImplementedError
+        self._require_connection(connection)
+        self._require_task_id(task_id)
+        cancelled = self._cancel_open_steps(connection, task_id)
+        logger.info("PlanStore.cancel_pending task_id=%s count=%s", task_id, cancelled)
+        return cancelled
 
     def render_plan(self, steps: tuple[PlanStep, ...]) -> str:
         """
@@ -322,6 +326,24 @@ class PlanStore:
         ).fetchone()
         if row is not None:
             raise ValueError(f"step order {int(row['step_order'])} already exists for task_id={task_id}")
+
+    def _cancel_open_steps(self, connection: sqlite3.Connection, task_id: str) -> int:
+        """
+        Mark pending and waiting_retry steps failed with error cancelled.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :return: number cancelled as int. Example: 1
+        """
+        cursor = connection.execute(
+            """
+            UPDATE plan_steps
+            SET status = ?, error = ?
+            WHERE task_id = ? AND status IN (?, ?)
+            """,
+            (_STATUS_FAILED, _CANCELLED_ERROR, task_id, _STATUS_PENDING, _STATUS_WAITING_RETRY),
+        )
+        return int(cursor.rowcount)
 
     def _require_failed_anchor(
         self,

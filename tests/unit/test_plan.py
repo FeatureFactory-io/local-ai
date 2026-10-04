@@ -320,6 +320,58 @@ def test_insert_after_shifts_later_open_steps_and_keeps_the_failed_row(
     assert "order=3" in caplog.text
 
 
+def test_cancel_pending_fails_open_steps_and_leaves_closed_rows(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """pending and waiting_retry become failed with error cancelled. Closed and running rows stay."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(
+        connection,
+        _TASK_ID,
+        (
+            StepDraft(1, "List chapter files"),
+            StepDraft(2, "Write a thesis per chapter"),
+            StepDraft(3, "Assemble summary.md"),
+            StepDraft(4, "Export pdf"),
+            StepDraft(5, "Check the pdf"),
+        ),
+    )
+    store.mark_running(connection, _TASK_ID, 1)
+    store.complete_step(connection, _TASK_ID, 1, "Found ch-01.md through ch-12.md", '{"success": true}')
+    store.mark_running(connection, _TASK_ID, 2)
+    store.fail_step(connection, _TASK_ID, 2, "weasyprint: CSS path missing")
+    store.mark_running(connection, _TASK_ID, 3)
+    _set_status(connection, _TASK_ID, 5, "waiting_retry")
+
+    with caplog.at_level(logging.INFO, logger="local_ai.plan.steps"):
+        cancelled = store.cancel_pending(connection, _TASK_ID)
+
+    assert cancelled == 2
+    steps = store.list_steps(connection, _TASK_ID)
+    assert [(step.order, step.status, step.error) for step in steps] == [
+        (1, "completed", ""),
+        (2, "failed", "weasyprint: CSS path missing"),
+        (3, "running", ""),
+        (4, "failed", "cancelled"),
+        (5, "failed", "cancelled"),
+    ]
+    assert steps[0].llm_synthesis == "Found ch-01.md through ch-12.md"
+    assert _TASK_ID in caplog.text
+    assert "count=2" in caplog.text
+
+
+def test_cancel_pending_returns_zero_when_nothing_is_open(tmp_path: Path) -> None:
+    """A plan with no pending or waiting_retry step cancels nothing."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(1, "List chapter files"),))
+    store.mark_running(connection, _TASK_ID, 1)
+    store.complete_step(connection, _TASK_ID, 1, "Found ch-01.md through ch-12.md", '{"success": true}')
+
+    assert store.cancel_pending(connection, _TASK_ID) == 0
+    assert store.list_steps(connection, _TASK_ID)[0].status == "completed"
+
+
 def test_insert_after_rejects_a_step_that_is_not_failed(tmp_path: Path) -> None:
     """insert_after does not shift or insert when the anchor is still pending."""
     store, connection = _open_store(tmp_path)
