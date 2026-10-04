@@ -250,6 +250,7 @@ def _completion_from_response(response: object) -> Completion:
         content=_text_field(message, "content"),
         thinking=_thinking_text(message),
         tool_calls=_tool_calls_from_message(message),
+        final_answer=_text_field(message, "content"),
     )
 
 

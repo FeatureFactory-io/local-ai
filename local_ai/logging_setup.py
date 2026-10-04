@@ -38,11 +38,22 @@ def configure_logging(log_path: Path) -> None:
     _detach_owned_handlers(root)
     rotated = _rotate_existing_log(log_path)
     _attach_process_handlers(root, log_path)
+    _quiet_litellm_stdout()
     logger.info("Starting configure_logging path=%s", log_path.name)
     if rotated:
         logger.info("Rotated previous log aside path=%s", log_path.name)
         return
     logger.info("Opened fresh log path=%s", log_path.name)
+
+
+def _quiet_litellm_stdout() -> None:
+    """
+    Drop LiteLLM INFO lines. That logger writes them to stdout and breaks MCP.
+
+    :return: None. Example: None
+    """
+    for name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _require_log_path(log_path: Path) -> None:

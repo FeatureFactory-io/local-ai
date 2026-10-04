@@ -70,7 +70,7 @@ def test_complete_with_thinking_content_and_tool_call_maps_completion() -> None:
         content="List the chapter files.",
         thinking="Reading ch-04.md.",
         tool_calls=(ToolCall(name="shell", command="ls *.md"),),
-        final_answer="",
+        final_answer="List the chapter files.",
     )
 
 
@@ -250,7 +250,7 @@ def test_complete_with_no_tool_calls_returns_empty_tuple() -> None:
     completion = _adapter(complete_fn).complete("Foundation\nTask", "qwen-14b")
     assert completion.tool_calls == ()
     assert completion.content == "No command this turn."
-    assert completion.final_answer == ""
+    assert completion.final_answer == "No command this turn."
 
 
 def test_complete_with_null_content_becomes_empty_string() -> None:
@@ -297,6 +297,7 @@ def test_complete_with_attribute_response_maps_message_fields() -> None:
         content="List the chapter files.",
         thinking="Reading ch-04.md.",
         tool_calls=(ToolCall(name="shell", command="ls *.md"),),
+        final_answer="List the chapter files.",
     )
 
 
