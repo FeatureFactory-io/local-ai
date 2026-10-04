@@ -121,10 +121,20 @@ class Blackboard:
         :param phase: phase word as str. Example: "acting"
         :param current_plan: readable plan as str. Example: "1. List chapter files (running)."
         :return: None. Example: None
+        :raises TypeError: when connection or current_plan has the wrong type. Example: None
+        :raises ValueError: when task_id or phase is blank, or the pin is missing. Example: "  "
         """
-        # Update phase and current_plan on that row.
-        # Log task_id and phase at INFO.
-        raise NotImplementedError
+        _require_connection(connection)
+        _require_task_id(task_id)
+        _require_text(phase, "phase", "acting")
+        _require_plan(current_plan)
+        _update_one(
+            connection,
+            "UPDATE tasks SET phase = ?, current_plan = ? WHERE id = ?",
+            (phase, current_plan, task_id),
+            task_id,
+        )
+        logger.info("blackboard.set_phase | task_id=%s | phase=%s", task_id, phase)
 
     def set_final(
         self,
@@ -230,6 +240,56 @@ def _require_pin(pin: TaskPin) -> None:
     _require_task_id(pin.task_id)
     if not isinstance(pin.access, AccessGrant):
         raise TypeError("pin.access must be AccessGrant. Example: AccessGrant('job')")
+
+
+def _require_text(value: object, name: str, example: str) -> None:
+    """
+    Reject a blank or non-string value.
+
+    :param value: candidate text as object. Example: "acting"
+    :param name: argument name as str. Example: "phase"
+    :param example: example used in the error as str. Example: "acting"
+    :return: None. Example: None
+    :raises ValueError: when value is blank or not a string. Example: "  "
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string. Example: '{example}'")
+
+
+def _require_plan(current_plan: str) -> None:
+    """
+    Reject a plan that is not text. An empty plan is allowed.
+
+    :param current_plan: readable plan as str. Example: "1. List chapter files (running)."
+    :return: None. Example: None
+    :raises TypeError: when current_plan is not a string. Example: None
+    """
+    if not isinstance(current_plan, str):
+        raise TypeError("current_plan must be str. Example: '1. List chapter files (running).'")
+
+
+def _update_one(
+    connection: sqlite3.Connection,
+    sql: str,
+    parameters: tuple[object, ...],
+    task_id: str,
+) -> None:
+    """
+    Update one pin row and commit. Zero rows means the pin is missing.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param sql: update statement as str. Example: "UPDATE tasks SET phase = ? WHERE id = ?"
+    :param parameters: bound values as tuple. Example: ("acting", "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: None. Example: None
+    :raises ValueError: when no row changed. Example: "missing-id"
+    """
+    updated = connection.execute(sql, parameters)
+    if updated.rowcount != 1:
+        raise ValueError(
+            f"pin not found task_id={task_id}. Example: '7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f'"
+        )
+    connection.commit()
 
 
 def _require_task_id(task_id: str) -> None:

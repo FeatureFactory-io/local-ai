@@ -181,6 +181,47 @@ def test_append_reasoning_with_unknown_id_raises(tmp_path: Path) -> None:
     assert connection.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 0
 
 
+def test_set_phase_updates_phase_and_plan(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Phase and the readable plan change together. Status stays put."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+    caplog.set_level(logging.INFO, logger="local_ai.blackboard.pins")
+
+    board.set_phase(connection, _TASK_ID, "acting", "1. List chapter files (running).")
+
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.phase == "acting"
+    assert loaded.current_plan == "1. List chapter files (running)."
+    assert loaded.status == "queued"
+    assert any(
+        record.levelno == logging.INFO
+        and f"task_id={_TASK_ID}" in record.message
+        and "phase=acting" in record.message
+        for record in caplog.records
+    )
+
+
+def test_set_phase_with_unknown_id_raises(tmp_path: Path) -> None:
+    """A missing pin is not created by a phase update."""
+    board, connection = _open_board(tmp_path)
+
+    with pytest.raises(ValueError, match="task_id"):
+        board.set_phase(connection, _TASK_ID, "acting", "1. List chapter files (running).")
+
+
+def test_set_phase_with_a_blank_phase_raises(tmp_path: Path) -> None:
+    """An empty phase word is rejected before the update."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+
+    with pytest.raises(ValueError, match="phase"):
+        board.set_phase(connection, _TASK_ID, "  ", "1. List chapter files (running).")
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.phase == "queued"
+
+
 def test_list_queued_orders_priority_then_created_at(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
