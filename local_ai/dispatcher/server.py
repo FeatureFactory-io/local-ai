@@ -1,13 +1,22 @@
 """FastMCP tools. Each tool calls DispatcherService or CapacityReader and returns the dict."""
 
+import json
 import logging
 import os
 import sqlite3
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TypeVar
 
+import litellm
+import psutil
 from mcp.server.fastmcp import FastMCP
 
+from local_ai.blackboard.pins import Blackboard
 from local_ai.capacity.reader import (
     CapacityReader,
     HttpReader,
@@ -15,17 +24,37 @@ from local_ai.capacity.reader import (
     PressureReader,
 )
 from local_ai.contracts import SubmitRequest
+from local_ai.db.database import Database
 from local_ai.dispatcher.service import DispatcherService
 from local_ai.dispatcher.slot import Slot
+from local_ai.llm.port import LiteLLMAdapter
+from local_ai.logging_setup import configure_logging
+from local_ai.plan.steps import PlanStore
+from local_ai.prompt.assemble import PromptAssembler
+from local_ai.tools.grant import GrantChecker
+from local_ai.tools.shell import ShellTool
 from local_ai.worker.loop import Worker
 
 
 logger = logging.getLogger(__name__)
 
 _HTTP_PORT_ENV = "LOCAL_AI_HTTP_PORT"
+_ENV_DB = "LOCAL_AI_DB"
+_ENV_JOBS = "LOCAL_AI_JOBS"
+_ENV_OLLAMA = "OLLAMA_HOST"
 _STATUS_QUEUED = "queued"
 _SERVER_NAME = "local-ai"
 _LOOPBACK_HOST = "127.0.0.1"
+_DEFAULT_DB = Path("data/local-ai.sqlite")
+_DEFAULT_JOBS = Path("data/jobs")
+_DEFAULT_LOG = Path("logs/app.log")
+_DEFAULT_OLLAMA = "http://127.0.0.1:11434"
+_BYTES_PER_GIGABYTE = 1024**3
+_PRESSURE_CRITICAL = 0.10
+_PRESSURE_WARN = 0.20
+_OLLAMA_TIMEOUT_S = 2.0
+_TRANSPORT_STDIO = "stdio"
+_TRANSPORT_HTTP = "streamable-http"
 _ReaderT = TypeVar("_ReaderT")
 
 # Worker is constructed in main and passed to Slot. Service does not import it.
@@ -67,10 +96,7 @@ class LocalAiServer:
         self._slot = slot
         self._capacity = capacity
         self._connection = connection
-        self._memory = memory
-        self._ollama = ollama
-        self._pressure = pressure
-        self._ollama_host = ollama_host
+        _store_probes(self, memory, ollama, pressure, ollama_host)
 
     def build(self) -> FastMCP:
         """
@@ -128,10 +154,8 @@ class LocalAiServer:
         :raises TypeError: when inputs is not a list of strings. Example: "notes.md"
         """
         logger.info("submit | entry")
-        snapshot = self._service.submit(
-            _submit_request(goal, done_when, priority, model, inputs, access),
-            self._connection,
-        )
+        request = _submit_request(goal, done_when, priority, model, inputs, access)
+        snapshot = self._service.submit(request, self._connection)
         if snapshot.get("status") == _STATUS_QUEUED:
             self._slot.kick()
         logger.info("submit | exit | status=%s", snapshot.get("status"))
@@ -174,14 +198,27 @@ def main() -> None:
 
     :return: None. Example: None
     """
-    # configure_logging. Open Database, migrate, DispatcherService.recover_running.
-    # Compose Blackboard, PlanStore, CapacityReader, GrantChecker, ShellTool,
-    # PromptAssembler, LiteLLMAdapter, Worker, Slot, and LocalAiServer.
-    # LocalAiServer.build.
-    # If LOCAL_AI_HTTP_PORT is unset, FastMCP run transport stdio.
-    # If it is set, FastMCP run transport streamable-http host 127.0.0.1 and that port.
-    # Logs stay on stderr and logs/app.log.
-    raise NotImplementedError
+    logger.info("main | entry")
+    _server, mcp = compose()
+    _run_server(mcp, http_port_from_env())
+
+
+def compose(env: Mapping[str, str] | None = None) -> tuple[LocalAiServer, FastMCP]:
+    """
+    Wire the process and recover running pins. Does not call mcp.run.
+
+    :param env: environment as Mapping[str, str] | None. Example: {"LOCAL_AI_DB": "data/local-ai.sqlite"}
+    :return: server and FastMCP as tuple[LocalAiServer, FastMCP]. Example: (LocalAiServer(...), FastMCP("local-ai"))
+    :raises TypeError: when env is not a mapping. Example: []
+    """
+    settings = _process_settings(env)
+    configure_logging(settings.log_path)
+    database, connection = _open_database(settings.db_path)
+    server = _wire(database, connection, settings)
+    recovered = server._service.recover_running(connection)
+    mcp = server.build()
+    logger.info("compose | recovered=%s", len(recovered))
+    return server, mcp
 
 
 def http_port_from_env(env: dict[str, str] | None = None) -> int | None:
@@ -232,6 +269,29 @@ def _integer_port(raw: object) -> int:
         raise ValueError("LOCAL_AI_HTTP_PORT must be an integer. Example: 8765") from exc
     logger.info("http_port_from_env | port=%s", port)
     return port
+
+
+def _store_probes(
+    server: "LocalAiServer",
+    memory: MemoryReader | None,
+    ollama: HttpReader | None,
+    pressure: PressureReader | None,
+    ollama_host: str | None,
+) -> None:
+    """
+    Keep the capacity probes on the server.
+
+    :param server: tool owner as LocalAiServer. Example: the composed server
+    :param memory: returns (total_gb, free_gb) as MemoryReader | None. Example: lambda: (64.0, 40.2)
+    :param ollama: HTTP reader as HttpReader | None. Example: lambda path: (200, {"models": []})
+    :param pressure: pressure reader as PressureReader | None. Example: lambda: "normal"
+    :param ollama_host: base URL as str | None. Example: "http://127.0.0.1:11434"
+    :return: None. Example: None
+    """
+    server._memory = memory
+    server._ollama = ollama
+    server._pressure = pressure
+    server._ollama_host = ollama_host
 
 
 def _register_tools(mcp: FastMCP, server: "LocalAiServer") -> None:
@@ -332,3 +392,278 @@ def _require_ollama_host(host: str | None) -> str:
     if not isinstance(host, str) or not host.strip():
         raise RuntimeError("ollama_host is required. Example: 'http://127.0.0.1:11434'")
     return host
+
+
+@dataclass(frozen=True)
+class _ProcessSettings:
+    """Paths and the environment the composition root reads once."""
+
+    db_path: Path
+    jobs_root: Path
+    ollama_host: str
+    log_path: Path
+    env: Mapping[str, str]
+
+
+def _run_server(mcp: FastMCP, port: int | None) -> None:
+    """
+    Start stdio, or streamable HTTP on the loopback port.
+
+    FastMCP.run takes the transport name. Host and port live on the server settings.
+
+    :param mcp: FastMCP server as FastMCP. Example: a server named "local-ai"
+    :param port: loopback port or None as int | None. Example: 8765
+    :return: None. Example: None
+    """
+    if port is None:
+        logger.info("main | transport=%s", _TRANSPORT_STDIO)
+        mcp.run(transport=_TRANSPORT_STDIO)
+        return
+    _run_loopback(mcp, port)
+
+
+def _run_loopback(mcp: FastMCP, port: int) -> None:
+    """
+    Bind streamable HTTP to 127.0.0.1. A non-loopback host is replaced.
+
+    :param mcp: FastMCP server as FastMCP. Example: a server named "local-ai"
+    :param port: loopback port as int. Example: 8765
+    :return: None. Example: None
+    """
+    mcp.settings.host = _LOOPBACK_HOST
+    mcp.settings.port = port
+    logger.info("main | transport=%s host=%s port=%s", _TRANSPORT_HTTP, _LOOPBACK_HOST, port)
+    mcp.run(transport=_TRANSPORT_HTTP)
+
+
+def _process_settings(env: Mapping[str, str] | None) -> _ProcessSettings:
+    """
+    Resolve database, jobs, Ollama, and the log path.
+
+    :param env: environment as Mapping[str, str] | None. Example: {"LOCAL_AI_DB": "data/local-ai.sqlite"}
+    :return: settings as _ProcessSettings. Example: _ProcessSettings(Path("data/local-ai.sqlite"), ...)
+    :raises TypeError: when env is not a mapping. Example: []
+    """
+    source = _port_environment(env)
+    return _ProcessSettings(
+        db_path=_path_setting(source, _ENV_DB, _DEFAULT_DB),
+        jobs_root=_path_setting(source, _ENV_JOBS, _DEFAULT_JOBS),
+        ollama_host=_text_setting(source, _ENV_OLLAMA, _DEFAULT_OLLAMA),
+        log_path=_DEFAULT_LOG,
+        env=source,
+    )
+
+
+def _path_setting(env: Mapping[str, str], key: str, default: Path) -> Path:
+    """
+    Read a path variable. Missing or blank keeps the default.
+
+    :param env: environment as Mapping[str, str]. Example: {"LOCAL_AI_DB": "data/local-ai.sqlite"}
+    :param key: variable name as str. Example: "LOCAL_AI_DB"
+    :param default: fallback path as Path. Example: Path("data/local-ai.sqlite")
+    :return: path as Path. Example: Path("data/local-ai.sqlite")
+    """
+    raw = env.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        return default
+    return Path(raw)
+
+
+def _text_setting(env: Mapping[str, str], key: str, default: str) -> str:
+    """
+    Read a text variable. Missing or blank keeps the default.
+
+    :param env: environment as Mapping[str, str]. Example: {"OLLAMA_HOST": "http://127.0.0.1:11434"}
+    :param key: variable name as str. Example: "OLLAMA_HOST"
+    :param default: fallback text as str. Example: "http://127.0.0.1:11434"
+    :return: text as str. Example: "http://127.0.0.1:11434"
+    """
+    raw = env.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        return default
+    return raw
+
+
+def _open_database(path: Path) -> tuple[Database, sqlite3.Connection]:
+    """
+    Connect and migrate.
+
+    :param path: sqlite file as Path. Example: Path("data/local-ai.sqlite")
+    :return: database and connection as tuple. Example: (Database(...), connection)
+    """
+    database = Database(path)
+    connection = database.connect()
+    database.migrate()
+    logger.info("compose | migrated path=%s", path)
+    return database, connection
+
+
+def _wire(
+    database: Database,
+    connection: sqlite3.Connection,
+    settings: _ProcessSettings,
+) -> LocalAiServer:
+    """
+    Construct the objects section 19 names, in that order.
+
+    :param database: process database as Database. Example: Database(Path("data/local-ai.sqlite"))
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param settings: process settings as _ProcessSettings. Example: the settings from _process_settings
+    :return: server as LocalAiServer. Example: LocalAiServer(...)
+    """
+    board = Blackboard(database)
+    plan = PlanStore(database)
+    capacity = CapacityReader()
+    shell = ShellTool(GrantChecker())
+    prompt = PromptAssembler()
+    llm = LiteLLMAdapter(litellm.completion, settings.env, settings.ollama_host)
+    worker = COMPOSER_WORKER(llm, shell, prompt, plan, board, connection)
+    service = _dispatcher(database, board, plan, capacity, settings)
+    slot = Slot(service, worker, connection, _utc_now)
+    return _local_server(service, slot, capacity, connection, settings)
+
+
+def _dispatcher(
+    database: Database,
+    board: Blackboard,
+    plan: PlanStore,
+    capacity: CapacityReader,
+    settings: _ProcessSettings,
+) -> DispatcherService:
+    """
+    Build the dispatcher with the process capacity probes.
+
+    :param database: process database as Database. Example: Database(Path("data/local-ai.sqlite"))
+    :param board: pin store as Blackboard. Example: Blackboard(database)
+    :param plan: step store as PlanStore. Example: PlanStore(database)
+    :param capacity: capacity reader as CapacityReader. Example: CapacityReader()
+    :param settings: process settings as _ProcessSettings. Example: the settings from _process_settings
+    :return: service as DispatcherService. Example: DispatcherService(...)
+    """
+    return DispatcherService(
+        database,
+        board,
+        plan,
+        capacity,
+        settings.jobs_root,
+        memory=_read_memory,
+        ollama=_read_ollama,
+        pressure=_read_pressure,
+        ollama_host=settings.ollama_host,
+    )
+
+
+def _local_server(
+    service: DispatcherService,
+    slot: Slot,
+    capacity: CapacityReader,
+    connection: sqlite3.Connection,
+    settings: _ProcessSettings,
+) -> LocalAiServer:
+    """
+    Store the same probes the dispatcher uses, so capacity does not open its own client.
+
+    :param service: pin service as DispatcherService. Example: the composed service
+    :param slot: worker slot as Slot. Example: Slot(service, worker, connection, clock)
+    :param capacity: capacity reader as CapacityReader. Example: CapacityReader()
+    :param connection: shared connection as sqlite3.Connection. Example: the Database connection
+    :param settings: process settings as _ProcessSettings. Example: the settings from _process_settings
+    :return: server as LocalAiServer. Example: LocalAiServer(...)
+    """
+    return LocalAiServer(
+        service,
+        slot,
+        capacity,
+        connection,
+        memory=_read_memory,
+        ollama=_read_ollama,
+        pressure=_read_pressure,
+        ollama_host=settings.ollama_host,
+    )
+
+
+def _utc_now() -> str:
+    """
+    UTC timestamp for the slot clock.
+
+    :return: timestamp as str. Example: "2026-10-04T18:40:02.000000Z"
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _read_memory() -> tuple[float, float]:
+    """
+    Read total and available memory in gigabytes.
+
+    :return: total and free gigabytes as tuple[float, float]. Example: (64.0, 40.2)
+    """
+    memory = psutil.virtual_memory()
+    total = memory.total / _BYTES_PER_GIGABYTE
+    free = memory.available / _BYTES_PER_GIGABYTE
+    logger.info("memory | total_gb=%.2f free_gb=%.2f", total, free)
+    return total, free
+
+
+def _read_pressure() -> str:
+    """
+    Map free memory over total onto normal, warn, or critical.
+
+    :return: pressure word as str. Example: "normal"
+    """
+    total, free = _read_memory()
+    if total <= 0:
+        logger.warning("pressure | total_gb=0 word=unknown")
+        return "unknown"
+    word = _pressure_word(free / total)
+    logger.info("pressure | word=%s", word)
+    return word
+
+
+def _pressure_word(ratio: float) -> str:
+    """
+    Pick a pressure word from the free-memory ratio.
+
+    :param ratio: free divided by total as float. Example: 0.5
+    :return: pressure word as str. Example: "normal"
+    """
+    if ratio < _PRESSURE_CRITICAL:
+        return "critical"
+    if ratio < _PRESSURE_WARN:
+        return "warn"
+    return "normal"
+
+
+def _read_ollama(url: str) -> tuple[int, dict]:
+    """
+    GET one Ollama URL. A connection error propagates so CapacityReader marks Ollama down.
+
+    :param url: full URL as str. Example: "http://127.0.0.1:11434/api/tags"
+    :return: status and JSON object as tuple[int, dict]. Example: (200, {"models": []})
+    :raises urllib.error.URLError: when the host does not answer. Example: connection refused
+    """
+    logger.info("ollama | GET")
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=_OLLAMA_TIMEOUT_S) as response:
+            return _json_body(response.status, response.read())
+    except urllib.error.HTTPError as exc:
+        logger.info("ollama | status=%s", exc.code)
+        return exc.code, {}
+
+
+def _json_body(status: int, raw: bytes) -> tuple[int, dict]:
+    """
+    Decode an Ollama JSON object. A non-object becomes an empty dict.
+
+    :param status: HTTP status as int. Example: 200
+    :param raw: response bytes as bytes. Example: b'{"models": []}'
+    :return: status and object as tuple[int, dict]. Example: (200, {"models": []})
+    """
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        logger.warning("ollama | body was not json status=%s", status)
+        return status, {}
+    if not isinstance(body, dict):
+        return status, {}
+    return status, body

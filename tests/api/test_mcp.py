@@ -3,7 +3,7 @@
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import anyio
@@ -12,12 +12,12 @@ from mcp.server.fastmcp import FastMCP
 
 from local_ai.blackboard.pins import Blackboard
 from local_ai.capacity.reader import CapacityReader
-from local_ai.contracts import Completion, ToolCall
+from local_ai.contracts import AccessGrant, Completion, TaskPin, ToolCall
 from local_ai.db.database import Database
-from local_ai.dispatcher.server import LocalAiServer, http_port_from_env
+from local_ai.dispatcher.server import LocalAiServer, compose, http_port_from_env, main
 from local_ai.dispatcher.service import DispatcherService
 from local_ai.dispatcher.slot import Slot
-from local_ai.llm.port import ScriptedLLM
+from local_ai.llm.port import LiteLLMAdapter, ScriptedLLM
 from local_ai.plan.steps import PlanStore
 from local_ai.prompt.assemble import PromptAssembler
 from local_ai.tools.grant import GrantChecker
@@ -39,6 +39,24 @@ _HOLD_SCRIPT = (
 Http = Callable[[str], tuple[int, dict]]
 Memory = Callable[[], tuple[float, float]]
 Pressure = Callable[[], str]
+_PIN = "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+
+
+@pytest.fixture(autouse=True)
+def _restore_root_logging() -> Iterator[None]:
+    """Put the root logger back after compose attaches process handlers."""
+    root = logging.getLogger()
+    saved_level = root.level
+    saved_handlers = list(root.handlers)
+    yield
+    for handler in list(root.handlers):
+        if handler not in saved_handlers:
+            root.removeHandler(handler)
+            handler.close()
+    for handler in saved_handlers:
+        if handler not in root.handlers:
+            root.addHandler(handler)
+    root.setLevel(saved_level)
 
 
 def test_http_port_from_env_missing_returns_none() -> None:
@@ -281,6 +299,68 @@ def test_build_in_process_calls_match_contract_keys(tmp_path: Path) -> None:
     assert set(capacity) == set(_contract("capacity_up.json"))
 
 
+def test_compose_requeues_a_running_pin_without_calling_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup opens the database, requeues a running pin, and returns before mcp.run."""
+    db_path = tmp_path / "local-ai.sqlite"
+    _insert_running(db_path, _PIN)
+    monkeypatch.chdir(tmp_path)
+    server, mcp = compose(
+        {"LOCAL_AI_DB": str(db_path), "LOCAL_AI_JOBS": str(tmp_path / "jobs")},
+    )
+
+    body = server.read(_PIN)
+    worker = server._slot._runner
+
+    assert body["status"] == "queued"
+    assert mcp.name == "local-ai"
+    assert _tool_names(mcp) == ["capacity", "read", "reprioritize", "submit"]
+    assert isinstance(server._service, DispatcherService)
+    assert isinstance(server._capacity, CapacityReader)
+    assert isinstance(server._slot, Slot)
+    assert isinstance(worker, Worker)
+    assert isinstance(worker._llm, LiteLLMAdapter)
+    assert isinstance(worker._shell, ShellTool)
+    assert isinstance(worker._shell._grant_checker, GrantChecker)
+    assert isinstance(worker._prompt, PromptAssembler)
+    assert isinstance(server._service._blackboard, Blackboard)
+    assert isinstance(server._service._plan, PlanStore)
+    assert (tmp_path / "logs" / "app.log").is_file()
+
+
+def test_main_uses_stdio_when_the_port_is_unset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unset port calls mcp.run with the stdio transport and does not bind."""
+    _point_process_at(monkeypatch, tmp_path)
+    monkeypatch.delenv("LOCAL_AI_HTTP_PORT", raising=False)
+    seen = _capture_run(monkeypatch)
+
+    main()
+
+    assert seen["transport"] == "stdio"
+    assert seen["called"] is True
+
+
+def test_main_uses_loopback_http_when_the_port_is_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A set port runs streamable HTTP on 127.0.0.1 even if the server host was changed."""
+    _point_process_at(monkeypatch, tmp_path)
+    monkeypatch.setenv("LOCAL_AI_HTTP_PORT", "8765")
+    seen = _capture_run(monkeypatch, spoil_host="0.0.0.0")
+
+    main()
+
+    assert seen["transport"] == "streamable-http"
+    assert seen["host"] == "127.0.0.1"
+    assert seen["port"] == 8765
+
+
 class _CountingReader(CapacityReader):
     """Real CapacityReader that counts read calls."""
 
@@ -423,6 +503,85 @@ def _dict_from_tool(result: object) -> dict:
     if isinstance(result, list) and result and hasattr(result[0], "text"):
         return json.loads(result[0].text)
     raise AssertionError(f"tool result was {type(result).__name__}")
+
+
+def _insert_running(db_path: Path, task_id: str) -> None:
+    """
+    Leave one running pin in a migrated database.
+
+    :param db_path: sqlite file as Path. Example: Path("data/local-ai.sqlite")
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: None. Example: None
+    """
+    database = Database(db_path)
+    connection = database.connect()
+    database.migrate()
+    Blackboard(database).insert_pin(connection, _queued_pin(task_id))
+    assert Blackboard(database).claim(connection, task_id, "2026-10-04T18:40:02Z") is True
+    connection.close()
+
+
+def _queued_pin(task_id: str) -> TaskPin:
+    """
+    Build a queued pin the blackboard will accept.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: pin as TaskPin. Example: a pin with status "queued"
+    """
+    return TaskPin(
+        task_id=task_id,
+        priority=40,
+        status="queued",
+        model="qwen-14b",
+        goal="Write a brief.",
+        done_when="brief.md exists",
+        access=AccessGrant("job"),
+        phase="queued",
+        created_at="2026-10-04T18:40:00Z",
+    )
+
+
+def _point_process_at(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    Point the process database and job root at a temp directory.
+
+    :param monkeypatch: env patcher as pytest.MonkeyPatch. Example: the test's monkeypatch
+    :param tmp_path: pytest directory as Path. Example: Path("/tmp/pytest/test0")
+    :return: None. Example: None
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LOCAL_AI_DB", str(tmp_path / "local-ai.sqlite"))
+    monkeypatch.setenv("LOCAL_AI_JOBS", str(tmp_path / "jobs"))
+
+
+def _capture_run(monkeypatch: pytest.MonkeyPatch, spoil_host: str | None = None) -> dict:
+    """
+    Replace mcp.run so main records the transport instead of binding.
+
+    :param monkeypatch: env patcher as pytest.MonkeyPatch. Example: the test's monkeypatch
+    :param spoil_host: host to set before run as str | None. Example: "0.0.0.0"
+    :return: captured call as dict. Example: {"called": False}
+    """
+    seen: dict[str, object] = {"called": False}
+    original = compose
+
+    def wrapped(env: dict[str, str] | None = None) -> tuple[LocalAiServer, FastMCP]:
+        server, mcp = original(env)
+        if spoil_host is not None:
+            mcp.settings.host = spoil_host
+
+        def run(transport: str = "stdio", mount_path: str | None = None, **kwargs: object) -> None:
+            seen["called"] = True
+            seen["transport"] = transport
+            seen["host"] = kwargs.get("host", mcp.settings.host)
+            seen["port"] = kwargs.get("port", mcp.settings.port)
+            seen["mount_path"] = mount_path
+
+        mcp.run = run  # type: ignore[method-assign]
+        return server, mcp
+
+    monkeypatch.setattr("local_ai.dispatcher.server.compose", wrapped)
+    return seen
 
 
 def _kick_count(caplog: pytest.LogCaptureFixture) -> int:
