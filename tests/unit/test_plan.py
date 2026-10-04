@@ -276,6 +276,72 @@ def test_fail_step_leaves_a_completed_step_completed(tmp_path: Path) -> None:
     assert row["result_json"] == '{"success": true}'
 
 
+def test_insert_after_shifts_later_open_steps_and_keeps_the_failed_row(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A new pending step lands at after_order+1. Later open steps move up. The failed row stays."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(
+        connection,
+        _TASK_ID,
+        (
+            StepDraft(1, "List chapter files"),
+            StepDraft(2, "Write a thesis per chapter"),
+            StepDraft(3, "Assemble summary.md"),
+            StepDraft(4, "Export pdf"),
+        ),
+    )
+    store.mark_running(connection, _TASK_ID, 1)
+    store.complete_step(connection, _TASK_ID, 1, "Found ch-01.md through ch-12.md", '{"success": true}')
+    store.mark_running(connection, _TASK_ID, 2)
+    store.fail_step(connection, _TASK_ID, 2, "weasyprint: CSS path missing")
+    _set_status(connection, _TASK_ID, 4, "waiting_retry")
+
+    with caplog.at_level(logging.INFO, logger="local_ai.plan.steps"):
+        new_order = store.insert_after(
+            connection,
+            _TASK_ID,
+            2,
+            "Fix the CSS path and run weasyprint again",
+        )
+
+    assert new_order == 3
+    steps = store.list_steps(connection, _TASK_ID)
+    assert [(step.order, step.action, step.status, step.error) for step in steps] == [
+        (1, "List chapter files", "completed", ""),
+        (2, "Write a thesis per chapter", "failed", "weasyprint: CSS path missing"),
+        (3, "Fix the CSS path and run weasyprint again", "pending", ""),
+        (4, "Assemble summary.md", "pending", ""),
+        (5, "Export pdf", "waiting_retry", ""),
+    ]
+    assert steps[0].llm_synthesis == "Found ch-01.md through ch-12.md"
+    assert _TASK_ID in caplog.text
+    assert "order=3" in caplog.text
+
+
+def test_insert_after_rejects_a_step_that_is_not_failed(tmp_path: Path) -> None:
+    """insert_after does not shift or insert when the anchor is still pending."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(
+        connection,
+        _TASK_ID,
+        (
+            StepDraft(1, "List chapter files"),
+            StepDraft(2, "Assemble summary.md"),
+        ),
+    )
+
+    with pytest.raises(InvalidStepTransition):
+        store.insert_after(connection, _TASK_ID, 1, "Fix the CSS path and run weasyprint again")
+
+    steps = store.list_steps(connection, _TASK_ID)
+    assert [(step.order, step.action, step.status) for step in steps] == [
+        (1, "List chapter files", "pending"),
+        (2, "Assemble summary.md", "pending"),
+    ]
+
+
 @pytest.mark.parametrize("status", ["pending", "waiting_retry", "failed"])
 def test_fail_step_rejects_a_step_that_is_not_running_or_completed(tmp_path: Path, status: str) -> None:
     """pending, waiting_retry, and an already failed step raise InvalidStepTransition."""

@@ -14,6 +14,7 @@ _STATUS_COMPLETED = "completed"
 _STATUS_FAILED = "failed"
 _STATUS_WAITING_RETRY = "waiting_retry"
 _MARK_RUNNING_SOURCES = frozenset({_STATUS_PENDING, _STATUS_WAITING_RETRY})
+_SHIFTABLE_STATUSES = frozenset({_STATUS_PENDING, _STATUS_WAITING_RETRY})
 _MIN_STEP_ORDER = 1
 
 
@@ -155,12 +156,14 @@ class PlanStore:
         :param after_order: failed step order as int. Example: 2
         :param action: new step sentence as str. Example: "Fix the CSS path and run weasyprint again"
         :return: new order as int. Example: 3
+        :raises InvalidStepTransition: when the anchor is not failed. Example: order 1 still pending
+        :raises ValueError: when action is empty. Example: "  "
+        :raises TypeError: when action is not a str. Example: None
         """
-        # Shift pending and waiting_retry rows with order greater than after_order.
-        # Leave the failed row failed.
-        # Insert the new row as pending at after_order + 1.
-        # Log task_id and the new order at INFO.
-        raise NotImplementedError
+        self._require_failed_anchor(connection, task_id, after_order, action)
+        new_order = self._insert_shifted_step(connection, task_id, after_order, action)
+        logger.info("PlanStore.insert_after task_id=%s order=%s", task_id, new_order)
+        return new_order
 
     def cancel_pending(self, connection: sqlite3.Connection, task_id: str) -> int:
         """
@@ -319,6 +322,156 @@ class PlanStore:
         ).fetchone()
         if row is not None:
             raise ValueError(f"step order {int(row['step_order'])} already exists for task_id={task_id}")
+
+    def _require_failed_anchor(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        after_order: int,
+        action: str,
+    ) -> None:
+        """
+        Require a failed anchor and a non-empty replacement action.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param after_order: failed step order as int. Example: 2
+        :param action: new step sentence as str. Example: "Fix the CSS path and run weasyprint again"
+        :return: None. Example: None
+        :raises InvalidStepTransition: when the anchor is not failed. Example: order 1 still pending
+        :raises ValueError: when action is empty. Example: "  "
+        """
+        self._require_step_address(connection, task_id, after_order)
+        self._require_action(action)
+        status = self._require_step_status(connection, task_id, after_order)
+        if status != _STATUS_FAILED:
+            raise InvalidStepTransition(
+                f"insert_after requires status=failed task_id={task_id} order={after_order}, got status={status}"
+            )
+
+    def _require_action(self, action: str) -> None:
+        """
+        Reject a blank replacement sentence.
+
+        :param action: new step sentence as str. Example: "Fix the CSS path and run weasyprint again"
+        :return: None. Example: None
+        :raises ValueError: when action is empty. Example: "  "
+        :raises TypeError: when action is not a str. Example: None
+        """
+        if not isinstance(action, str):
+            raise TypeError(f"action must be str, got {type(action).__name__}")
+        if not action.strip():
+            raise ValueError(f"step action must be a non-empty str, got {action!r}")
+
+    def _insert_shifted_step(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        after_order: int,
+        action: str,
+    ) -> int:
+        """
+        Shift later open steps and insert a pending step at after_order + 1.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param after_order: failed step order as int. Example: 2
+        :param action: new step sentence as str. Example: "Fix the CSS path and run weasyprint again"
+        :return: new order as int. Example: 3
+        :raises InvalidStepTransition: when a later completed or failed row blocks the shift. Example: order 4 completed
+        """
+        self._require_shift_room(connection, task_id, after_order)
+        self._shift_later_open_steps(connection, task_id, after_order)
+        new_order = after_order + 1
+        self._insert_one_pending(connection, task_id, new_order, action)
+        return new_order
+
+    def _require_shift_room(self, connection: sqlite3.Connection, task_id: str, after_order: int) -> None:
+        """
+        Reject a shift whose destination is a completed, failed, or running row.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param after_order: failed step order as int. Example: 2
+        :return: None. Example: None
+        :raises InvalidStepTransition: when a later closed row blocks an open step. Example: order 4 completed
+        """
+        occupied = self._later_statuses(connection, task_id, after_order)
+        for order, status in occupied.items():
+            if status not in _SHIFTABLE_STATUSES:
+                continue
+            blocker = occupied.get(order + 1)
+            if blocker is not None and blocker not in _SHIFTABLE_STATUSES:
+                raise InvalidStepTransition(
+                    f"cannot shift order={order} onto status={blocker} task_id={task_id}"
+                )
+
+    def _later_statuses(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        after_order: int,
+    ) -> dict[int, str]:
+        """
+        Map later step orders to their statuses.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param after_order: failed step order as int. Example: 2
+        :return: order to status as dict[int, str]. Example: {3: "pending", 4: "waiting_retry"}
+        """
+        rows = connection.execute(
+            """
+            SELECT step_order, status FROM plan_steps
+            WHERE task_id = ? AND step_order > ?
+            """,
+            (task_id, after_order),
+        ).fetchall()
+        return {int(row["step_order"]): str(row["status"]) for row in rows}
+
+    def _shift_later_open_steps(self, connection: sqlite3.Connection, task_id: str, after_order: int) -> None:
+        """
+        Move pending and waiting_retry rows after after_order up by one.
+
+        Highest order moves first so the unique (task_id, step_order) constraint holds.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param after_order: failed step order as int. Example: 2
+        :return: None. Example: None
+        """
+        rows = connection.execute(
+            """
+            SELECT step_order FROM plan_steps
+            WHERE task_id = ? AND step_order > ? AND status IN (?, ?)
+            ORDER BY step_order DESC
+            """,
+            (task_id, after_order, _STATUS_PENDING, _STATUS_WAITING_RETRY),
+        ).fetchall()
+        for row in rows:
+            current = int(row["step_order"])
+            connection.execute(
+                "UPDATE plan_steps SET step_order = ? WHERE task_id = ? AND step_order = ?",
+                (current + 1, task_id, current),
+            )
+
+    def _insert_one_pending(self, connection: sqlite3.Connection, task_id: str, order: int, action: str) -> None:
+        """
+        Insert one pending step at an order the shift just opened.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: new step order as int. Example: 3
+        :param action: new step sentence as str. Example: "Fix the CSS path and run weasyprint again"
+        :return: None. Example: None
+        """
+        connection.execute(
+            """
+            INSERT INTO plan_steps (task_id, step_order, action, status)
+            VALUES (?, ?, ?, ?)
+            """,
+            (task_id, order, action, _STATUS_PENDING),
+        )
 
     def _completed_step_stays(self, connection: sqlite3.Connection, task_id: str, order: int) -> bool:
         """
