@@ -1,5 +1,7 @@
 """Queue, pin updates, and the single-owner claim. Does not import the worker package."""
 
+import logging
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -8,6 +10,12 @@ from local_ai.capacity.reader import CapacityReader
 from local_ai.contracts import SubmitRequest, TaskPin
 from local_ai.db.database import Database
 from local_ai.plan.steps import PlanStore
+
+
+logger = logging.getLogger(__name__)
+
+_GRANT_MODES = ("job", "paths", "home")
+_JOB_MODE = "job"
 
 
 class DispatcherService:
@@ -64,12 +72,18 @@ class DispatcherService:
         :param inputs: source files as tuple[str, ...]. Example: ()
         :param grant_mode: job, paths, or home as str. Example: "job"
         :return: job directory as Path. Example: Path("data/jobs/7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+        :raises ValueError: when task_id is blank or grant_mode is unknown. Example: "root"
+        :raises TypeError: when job-mode inputs is not a tuple of strings. Example: ["/tmp/notes.md"]
         """
-        # mkdir jobs_root/task_id.
-        # When grant_mode is job, copy each input file into that directory.
-        # paths and home modes still create the directory and do not copy the granted trees.
-        # Log the directory at INFO.
-        raise NotImplementedError
+        logger.info("Starting copy_job_inputs task_id=%s grant_mode=%s", task_id, grant_mode)
+        _require_grant_mode(grant_mode)
+        directory = _create_job_directory(self._jobs_root, task_id)
+        if grant_mode == _JOB_MODE:
+            _copy_job_files(inputs, directory)
+        else:
+            logger.info("dispatcher.copy_job_inputs | skip_copy | grant=%s", grant_mode)
+        logger.info("dispatcher.copy_job_inputs | directory=%s grant=%s", directory, grant_mode)
+        return directory
 
     def read_pin(self, task_id: str, connection: sqlite3.Connection) -> dict:
         """
@@ -146,3 +160,89 @@ class DispatcherService:
         # Blackboard.set_final. PlanStore.cancel_pending when status is failed.
         # Log dispatcher.finish with task_id, status, and the artifact count at INFO.
         raise NotImplementedError
+
+
+def _require_grant_mode(grant_mode: str) -> None:
+    """
+    Accept job, paths, or home.
+
+    :param grant_mode: grant mode as str. Example: "job"
+    :return: None. Example: None
+    :raises ValueError: when grant_mode is unknown. Example: "root"
+    """
+    if grant_mode not in _GRANT_MODES:
+        raise ValueError(
+            f"grant_mode must be job, paths, or home. Example: 'job'; got {grant_mode!r}"
+        )
+
+
+def _create_job_directory(jobs_root: Path, task_id: str) -> Path:
+    """
+    Make jobs_root/task_id. The id must be one path segment.
+
+    :param jobs_root: job directory root as Path. Example: Path("data/jobs")
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: job directory as Path. Example: Path("data/jobs/7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+    :raises TypeError: when jobs_root is not a Path. Example: "data/jobs"
+    :raises ValueError: when task_id is blank or contains a separator. Example: "  "
+    """
+    checked = _require_task_id(task_id)
+    if not isinstance(jobs_root, Path):
+        raise TypeError("jobs_root must be Path. Example: Path('data/jobs')")
+    directory = jobs_root / checked
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _require_task_id(task_id: str) -> str:
+    """
+    Reject a blank id or one that could leave the job root.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: the same id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :raises ValueError: when task_id is blank or not a single segment. Example: "../other"
+    """
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError(
+            "task_id must be a non-empty string. Example: '7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f'"
+        )
+    if "/" in task_id or "\\" in task_id or task_id in {".", ".."}:
+        raise ValueError(
+            "task_id must be a single path segment. Example: '7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f'"
+        )
+    return task_id
+
+
+def _copy_job_files(inputs: tuple[str, ...], directory: Path) -> None:
+    """
+    Copy existing files into the job directory. Directories are left in place.
+
+    :param inputs: source paths as tuple[str, ...]. Example: ("/tmp/notes.md",)
+    :param directory: job directory as Path. Example: Path("data/jobs/7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+    :return: None. Example: None
+    :raises TypeError: when inputs is not a tuple. Example: ["/tmp/notes.md"]
+    :raises ValueError: when an entry is not a non-empty string. Example: ""
+    """
+    if not isinstance(inputs, tuple):
+        raise TypeError("inputs must be a tuple of paths. Example: ()")
+    for raw in inputs:
+        _copy_one_file(raw, directory)
+
+
+def _copy_one_file(raw: object, directory: Path) -> None:
+    """
+    Copy one existing file. A missing path or a directory is skipped.
+
+    :param raw: source path as object. Example: "/tmp/notes.md"
+    :param directory: job directory as Path. Example: Path("data/jobs/7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+    :return: None. Example: None
+    :raises ValueError: when raw is not a non-empty string. Example: ""
+    """
+    if not isinstance(raw, str) or raw == "":
+        raise ValueError("input path must be a non-empty string. Example: '/tmp/notes.md'")
+    source = Path(raw)
+    if not source.is_file():
+        logger.info("dispatcher.copy_job_inputs | skip | reason=not_a_file name=%s", source.name)
+        return
+    shutil.copy2(source, directory / source.name)
+    logger.info("dispatcher.copy_job_inputs | copied | name=%s", source.name)
