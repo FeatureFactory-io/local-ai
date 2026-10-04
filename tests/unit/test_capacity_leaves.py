@@ -95,12 +95,13 @@ def test_read_pressure_logs_warning_when_reader_raises(caplog: pytest.LogCapture
     )
 
 
-def test_read_still_raises_not_implemented() -> None:
-    """Plan A fills recommend and read_pressure. read stays a stub until Plan B."""
-    with pytest.raises(NotImplementedError):
-        CapacityReader().read(
-            memory=lambda: (64.0, 40.2),
-            ollama=lambda path: (200, {"models": []}),
-            pressure=lambda: "normal",
-            ollama_host="http://127.0.0.1:11434",
-        )
+def test_read_returns_capacity_body() -> None:
+    """Plan B fills read. Field-level proof lives in test_capacity_read.py."""
+    body = CapacityReader().read(
+        memory=lambda: (64.0, 40.2),
+        ollama=lambda path: (200, {"models": [{"name": "qwen2.5:14b"}]}),
+        pressure=lambda: "normal",
+        ollama_host="http://127.0.0.1:11434",
+    )
+    assert body["status"] == "ok"
+    assert body["ollama"] == "up"
