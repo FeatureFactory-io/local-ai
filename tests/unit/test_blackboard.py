@@ -181,6 +181,60 @@ def test_append_reasoning_with_unknown_id_raises(tmp_path: Path) -> None:
     assert connection.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 0
 
 
+def test_claim_moves_a_queued_pin_to_running(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The first claim sets running and started_at. Phase stays as it was."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+    caplog.set_level(logging.INFO, logger="local_ai.blackboard.pins")
+
+    assert board.claim(connection, _TASK_ID, "2026-10-04T18:40:02Z") is True
+
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.status == "running"
+    assert loaded.started_at == "2026-10-04T18:40:02Z"
+    assert loaded.phase == "queued"
+    assert any(
+        record.levelno == logging.INFO
+        and f"task_id={_TASK_ID}" in record.message
+        and "claimed=True" in record.message
+        for record in caplog.records
+    )
+
+
+def test_claim_a_second_time_returns_false(tmp_path: Path) -> None:
+    """A pin that is already running is not claimed again."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+    assert board.claim(connection, _TASK_ID, "2026-10-04T18:40:02Z") is True
+
+    assert board.claim(connection, _TASK_ID, "2026-10-04T18:41:00Z") is False
+
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.status == "running"
+    assert loaded.started_at == "2026-10-04T18:40:02Z"
+
+
+def test_claim_with_unknown_id_returns_false(tmp_path: Path) -> None:
+    """A missing pin is not created by a claim."""
+    board, connection = _open_board(tmp_path)
+
+    assert board.claim(connection, _TASK_ID, "2026-10-04T18:40:02Z") is False
+
+
+def test_claim_with_a_blank_started_at_raises(tmp_path: Path) -> None:
+    """Dispatch time is required before the conditional update."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+
+    with pytest.raises(ValueError, match="started_at"):
+        board.claim(connection, _TASK_ID, " ")
+    loaded = board.get_pin(connection, _TASK_ID)
+    assert loaded is not None
+    assert loaded.status == "queued"
+
+
 def test_update_priority_changes_priority_only(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """Priority changes. Status is left to the caller."""
     board, connection = _open_board(tmp_path)

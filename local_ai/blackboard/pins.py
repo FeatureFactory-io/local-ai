@@ -11,6 +11,7 @@ from local_ai.db.database import Database
 logger = logging.getLogger(__name__)
 
 _QUEUED = "queued"
+_RUNNING = "running"
 _TRUNCATION_TEXT = "earlier notes were truncated"
 _TRUNCATION_AT = "2026-10-04T00:00:00Z"
 
@@ -190,11 +191,15 @@ class Blackboard:
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param started_at: dispatch time as str. Example: "2026-10-04T18:40:02Z"
         :return: whether this call won the row as bool. Example: True
+        :raises TypeError: when connection is not a Connection. Example: None
+        :raises ValueError: when task_id or started_at is blank. Example: " "
         """
-        # UPDATE tasks SET status='running', started_at=? WHERE id=? AND status='queued'.
-        # Return True only when the update changed one row.
-        # Log the task_id and the boolean at INFO.
-        raise NotImplementedError
+        _require_connection(connection)
+        _require_task_id(task_id)
+        _require_text(started_at, "started_at", "2026-10-04T18:40:02Z")
+        won = _claim_queued(connection, task_id, started_at)
+        logger.info("blackboard.claim | task_id=%s | claimed=%s", task_id, won)
+        return won
 
     def requeue_running(self, connection: sqlite3.Connection) -> tuple[str, ...]:
         """
@@ -249,6 +254,25 @@ def _require_pin(pin: TaskPin) -> None:
     _require_task_id(pin.task_id)
     if not isinstance(pin.access, AccessGrant):
         raise TypeError("pin.access must be AccessGrant. Example: AccessGrant('job')")
+
+
+def _claim_queued(connection: sqlite3.Connection, task_id: str, started_at: str) -> bool:
+    """
+    Set running only while the row is still queued.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param started_at: dispatch time as str. Example: "2026-10-04T18:40:02Z"
+    :return: whether one row changed as bool. Example: True
+    """
+    updated = connection.execute(
+        "UPDATE tasks SET status = ?, started_at = ? WHERE id = ? AND status = ?",
+        (_RUNNING, started_at, task_id, _QUEUED),
+    )
+    if updated.rowcount != 1:
+        return False
+    connection.commit()
+    return True
 
 
 def _require_priority(priority: object) -> None:
