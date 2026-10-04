@@ -24,10 +24,18 @@ from local_ai.prompt.assemble import PromptAssembler
 from local_ai.tools.grant import GrantChecker
 from local_ai.tools.shell import ShellTool
 from local_ai.worker.loop import Worker
+from tests.support.agent_story import assert_agent_story
 from tests.support.log_story import assert_log_story
 
 
 _TASK_ID = "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "llm_scripts"
+_HAPPY_BEATS = (
+    {"workflow": "planning"},
+    {"tool": "shell"},
+    {"effect": "step_completed"},
+)
+_FAIL_COMMAND = "python3 -c \"import sys; sys.stderr.write('boom'); raise SystemExit(4)\""
 
 
 def test_parse_plan_with_numbered_content_returns_drafts(tmp_path: Path) -> None:
@@ -272,6 +280,68 @@ def test_adapt_after_failure_inserts_replacement_and_keeps_failed_row(
     assert_log_story(caplog.records, "worker.adapt", "inserted", [f"task_id={_TASK_ID}", "step=2"])
 
 
+def test_worker_module_does_not_import_dispatcher() -> None:
+    """The worker returns a status word. It does not import the dispatcher."""
+    text = (Path(__file__).resolve().parents[2] / "local_ai" / "worker" / "loop.py").read_text(
+        encoding="utf-8"
+    )
+    assert "from local_ai.dispatcher" not in text
+    assert "import local_ai.dispatcher" not in text
+
+
+def test_run_task_happy_path_records_agent_story(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Planning, the shell, and a completed step happen in that order."""
+    worker, connection, job_dir = _open_worker(tmp_path, _script("prf-hybrid"))
+    caplog.set_level(logging.INFO)
+
+    outcome = worker.run_task(_TASK_ID)
+
+    assert outcome == "completed"
+    assert [(step.order, step.status) for step in _steps(worker, connection)] == [
+        (1, "completed"),
+        (2, "completed"),
+    ]
+    assert (job_dir / "marker.txt").read_text(encoding="utf-8") == "marker"
+    assert_agent_story(worker.trace, _HAPPY_BEATS)
+    assert_log_story(
+        caplog.records,
+        "worker.step",
+        "acting",
+        [f"task_id={_TASK_ID}", "step=1", "tool=shell"],
+    )
+
+
+def test_run_task_with_empty_plan_returns_failed(tmp_path: Path) -> None:
+    """A planning turn with no numbered step fails the pin before any step runs."""
+    worker, connection, _job_dir = _open_worker(tmp_path, (Completion(content="I cannot plan"),))
+
+    outcome = worker.run_task(_TASK_ID)
+
+    assert outcome == "failed"
+    assert _steps(worker, connection) == ()
+
+
+def test_run_task_stops_on_third_identical_failure(tmp_path: Path) -> None:
+    """The third identical command returns failed and does not insert another step."""
+    script = (
+        Completion(content="1. Run the check"),
+        Completion(thinking="Running the check.", tool_calls=(ToolCall("shell", _FAIL_COMMAND),)),
+        Completion(final_answer="Retry the check"),
+        Completion(thinking="Running the check.", tool_calls=(ToolCall("shell", _FAIL_COMMAND),)),
+        Completion(final_answer="Retry the check again"),
+        Completion(thinking="Running the check.", tool_calls=(ToolCall("shell", _FAIL_COMMAND),)),
+    )
+    worker, connection, _job_dir = _open_worker(tmp_path, script)
+
+    outcome = worker.run_task(_TASK_ID)
+
+    assert outcome == "failed"
+    assert [step.status for step in _steps(worker, connection)] == ["failed", "failed", "failed"]
+
+
 def _open_worker(
     tmp_path: Path,
     script: tuple[Completion, ...],
@@ -299,6 +369,36 @@ def _open_worker(
         connection,
     )
     return worker, connection, job_dir
+
+
+def _script(name: str) -> tuple[Completion, ...]:
+    """
+    Load one scripted-LLM fixture.
+
+    :param name: fixture directory as str. Example: "prf-hybrid"
+    :return: turns as tuple[Completion, ...]. Example: (Completion(content="1. Write the marker file"),)
+    """
+    payload = json.loads((_FIXTURES / name / "turns.json").read_text(encoding="utf-8"))
+    return tuple(_completion(turn) for turn in payload["turns"])
+
+
+def _completion(turn: dict) -> Completion:
+    """
+    Build one completion from a fixture turn.
+
+    :param turn: fixture object as dict. Example: {"content": "1. Write the marker file"}
+    :return: completion as Completion. Example: Completion(content="1. Write the marker file")
+    """
+    calls = tuple(
+        ToolCall(str(item["name"]), str(item["command"]))
+        for item in turn.get("tool_calls", [])
+    )
+    return Completion(
+        content=str(turn.get("content", "")),
+        thinking=str(turn.get("thinking", "")),
+        tool_calls=calls,
+        final_answer=str(turn.get("final_answer", "")),
+    )
 
 
 def _insert_pending(worker: Worker, connection: sqlite3.Connection, drafts: tuple[StepDraft, ...]) -> None:

@@ -83,15 +83,15 @@ class Worker:
 
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :return: final status as str. Example: "completed"
+        :raises ValueError: when task_id is blank or the pin is missing. Example: ""
         """
-        # Load the pin from Blackboard. Log entry with task_id.
-        # Set phase to planning. Assemble the prompt. Ask LlmPort for the plan.
-        # parse_plan, then PlanStore.insert_steps, then Blackboard.set_phase with the readable plan.
-        # For each pending step, run_step. A failed step calls adapt_after_failure
-        # unless note_identical_failure says the pin must stop.
-        # When no pending steps remain, return "completed".
-        # The caller (Slot) passes that word to DispatcherService.finish.
-        raise NotImplementedError
+        logger.info("Starting run_task task_id=%s", task_id)
+        _require_task_id(task_id)
+        if not self._store_planned_steps(task_id):
+            return "failed"
+        outcome = self._run_pending_steps(task_id, self._require_pin(task_id).model)
+        logger.info("worker.task | finished | task_id=%s status=%s", task_id, outcome)
+        return outcome
 
     def parse_plan(self, completion: Completion) -> tuple[StepDraft, ...]:
         """
@@ -390,6 +390,97 @@ class Worker:
         logger.info("worker.step | failed | task_id=%s step=%s", task_id, order)
         return "failed"
 
+    def _store_planned_steps(self, task_id: str) -> bool:
+        """
+        Ask for a plan and insert it. An empty plan fails the pin.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :return: True when steps were stored as bool. Example: True
+        """
+        pin = self._require_pin(task_id)
+        self._publish_phase(task_id, "planning")
+        completion = self._llm.complete(self._planning_prompt(pin), pin.model)
+        if not self._insert_parsed_plan(task_id, completion):
+            return False
+        self._publish_phase(task_id, "planning")
+        return True
+
+    def _insert_parsed_plan(self, task_id: str, completion: Completion) -> bool:
+        """
+        Parse and insert drafts. ValueError means the pin stops.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param completion: planning turn as Completion. Example: Completion(content="1. List chapter files")
+        :return: True when rows were inserted as bool. Example: True
+        """
+        try:
+            drafts = self.parse_plan(completion)
+        except ValueError:
+            logger.info("worker.task | failed | task_id=%s reason=empty_plan", task_id)
+            return False
+        self._plan.insert_steps(self._connection, task_id, drafts)
+        return True
+
+    def _planning_prompt(self, pin: TaskPin) -> str:
+        """
+        Assemble the planning prompt from the pin.
+
+        :param pin: live pin as TaskPin. Example: a pin with goal "Write a marker file in the job folder."
+        :return: prompt as str. Example: "Foundation\\nShell\\nTask"
+        """
+        return self._prompt.assemble(
+            pin.goal,
+            pin.done_when,
+            pin.access,
+            (),
+            pin.current_plan,
+            "",
+        )
+
+    def _run_pending_steps(self, task_id: str, model_name: str) -> str:
+        """
+        Run each pending step. Stop when one cannot be recovered.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param model_name: logical size as str. Example: "qwen-14b"
+        :return: "completed" or "failed" as str. Example: "completed"
+        """
+        while True:
+            pending = self._next_pending(task_id)
+            if pending is None:
+                return "completed"
+            if self._run_or_adapt(task_id, pending.order, model_name) == "failed":
+                return "failed"
+
+    def _next_pending(self, task_id: str) -> PlanStep | None:
+        """
+        Return the lowest-order pending step.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :return: step or None as PlanStep | None. Example: None
+        """
+        for step in self._plan.list_steps(self._connection, task_id):
+            if step.status == "pending":
+                return step
+        return None
+
+    def _run_or_adapt(self, task_id: str, order: int, model_name: str) -> str:
+        """
+        Run one step. A shell failure adapts unless the command has failed three times.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 1
+        :param model_name: logical size as str. Example: "qwen-14b"
+        :return: "completed", "failed", or "adapted" as str. Example: "completed"
+        """
+        if self.run_step(task_id, order, model_name) == "completed":
+            return "completed"
+        command = self._failed_command
+        if command is None or self.note_identical_failure(task_id, order, command):
+            return "failed"
+        self.adapt_after_failure(task_id, order, model_name, self._failed_error)
+        return "adapted"
+
     def _insert_replacement(self, task_id: str, order: int, model_name: str, error: str) -> int:
         """
         Ask for one replacement sentence and insert it after the failed step.
@@ -445,6 +536,21 @@ class Worker:
 
 _ROUNDS = MAX_ROUNDS_PER_STEP
 _IDENTICAL = MAX_IDENTICAL_FAILURES
+
+
+def _require_task_id(task_id: str) -> None:
+    """
+    Reject a blank pin id.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: None. Example: None
+    :raises ValueError: when task_id is blank. Example: ""
+    :raises TypeError: when task_id is not a str. Example: None
+    """
+    if not isinstance(task_id, str):
+        raise TypeError("task_id must be str. Example: '7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f'")
+    if not task_id.strip():
+        raise ValueError("task_id must be a non-empty str. Example: '7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f'")
 
 
 def _require_adapt_args(task_id: str, order: int, model_name: str, error: str) -> None:
