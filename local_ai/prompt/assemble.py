@@ -12,6 +12,13 @@ _FOUNDATION_TEXT = (
     "After a failed command, revise the remaining plan. "
     "Emit a short reasoning note before each command."
 )
+_SHELL_BRIEF_TEXT = (
+    "python3, curl, pandoc, weasyprint, and mmdc are on PATH. "
+    "Use python3 for files, curl to fetch, pandoc for markdown, "
+    "weasyprint for PDF, and mmdc for Mermaid. "
+    "Stay inside the access grant. "
+    "Declare output files when a step produces them."
+)
 
 
 class PromptAssembler:
@@ -57,9 +64,8 @@ class PromptAssembler:
 
         :return: brief as str. Example: "python3, curl, pandoc, weasyprint, and mmdc are on PATH."
         """
-        # Name python3, curl, pandoc, weasyprint, and mmdc.
-        # Tell the model to stay inside the access grant and to declare output files.
-        raise NotImplementedError
+        logger.info("PromptAssembler._shell_brief")
+        return _SHELL_BRIEF_TEXT
 
     def _task(
         self,
