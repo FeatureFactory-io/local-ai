@@ -98,9 +98,102 @@ class GrantChecker:
         :param argv: command tokens as tuple[str, ...]. Example: ("cat", "/etc/passwd")
         :return: None. Example: None
         :raises AccessDenied: when cwd or a resolved path argument is outside the grant. Example: Path("/etc/passwd")
+        :raises TypeError: when grant, cwd, or argv has the wrong type. Example: cwd="/tmp"
         """
-        # Resolve cwd and every token that looks like a path, including ".." that escapes.
-        # Compare each resolved path to the grant roots.
-        # Raise AccessDenied before any process is started.
-        # Log the denied path at WARNING. Log an allowed cwd at INFO.
-        raise NotImplementedError
+        self._validate_check_inputs(grant, cwd, argv)
+        roots = _resolved_roots(grant)
+        resolved_cwd = cwd.resolve()
+        self._require_inside(resolved_cwd, roots)
+        self._require_argv_inside(resolved_cwd, argv, roots)
+        logger.info(f"GrantChecker.check_paths allowed cwd={resolved_cwd}")
+
+    def _validate_check_inputs(
+        self,
+        grant: AccessGrant,
+        cwd: Path,
+        argv: tuple[str, ...],
+    ) -> None:
+        """
+        Reject arguments that are not a grant, a directory, and command tokens.
+
+        :param grant: resolved grant as AccessGrant. Example: AccessGrant(mode="job")
+        :param cwd: working directory as Path. Example: Path("data/jobs/7c1e0a2e")
+        :param argv: command tokens as tuple[str, ...]. Example: ("cat", "/etc/passwd")
+        :return: None. Example: None
+        :raises TypeError: when an argument has the wrong type. Example: cwd="/tmp"
+        """
+        if not isinstance(grant, AccessGrant):
+            raise TypeError(f"grant must be AccessGrant, got {type(grant).__name__}")
+        if not isinstance(cwd, Path):
+            raise TypeError(f"cwd must be Path, got {type(cwd).__name__}")
+        if not isinstance(argv, tuple) or any(not isinstance(token, str) for token in argv):
+            raise TypeError("argv must be tuple[str, ...]")
+
+    def _require_argv_inside(
+        self,
+        cwd: Path,
+        argv: tuple[str, ...],
+        roots: tuple[Path, ...],
+    ) -> None:
+        """
+        Reject every path-like token that resolves outside the grant.
+
+        :param cwd: resolved working directory as Path. Example: Path("/data/jobs/7c1e0a2e")
+        :param argv: command tokens as tuple[str, ...]. Example: ("cat", "../secret.md")
+        :param roots: allowed directories as tuple[Path, ...]. Example: (Path("/data/jobs/7c1e0a2e"),)
+        :return: None. Example: None
+        :raises AccessDenied: when a token resolves outside the roots. Example: Path("/etc/passwd")
+        """
+        for token in argv:
+            if _is_path_token(token):
+                self._require_inside(_resolve_token(cwd, token), roots)
+
+    def _require_inside(self, path: Path, roots: tuple[Path, ...]) -> None:
+        """
+        Raise when path is not the root and not inside one.
+
+        :param path: resolved path as Path. Example: Path("/etc/passwd")
+        :param roots: allowed directories as tuple[Path, ...]. Example: (Path("/data/jobs/7c1e0a2e"),)
+        :return: None. Example: None
+        :raises AccessDenied: when path leaves every root. Example: Path("/etc/passwd")
+        """
+        if any(path == root or path.is_relative_to(root) for root in roots):
+            return
+        logger.warning(f"GrantChecker.check_paths denied path={path}")
+        raise AccessDenied(path)
+
+
+def _resolved_roots(grant: AccessGrant) -> tuple[Path, ...]:
+    """
+    Resolve each stored root so .. and symlinks compare as real directories.
+
+    :param grant: resolved grant as AccessGrant. Example: AccessGrant(mode="job", paths=("data/jobs/7c1e0a2e",))
+    :return: absolute roots as tuple[Path, ...]. Example: (Path("/repo/data/jobs/7c1e0a2e"),)
+    """
+    return tuple(Path(root).resolve() for root in grant.paths)
+
+
+def _is_path_token(token: str) -> bool:
+    """
+    Decide whether the shell would treat this token as a filesystem path.
+
+    :param token: one argv token as str. Example: "../books/secret.md"
+    :return: True when the token is path-like as bool. Example: True
+    """
+    if token in {".", ".."} or token.startswith(("/", "./", "../", "~")):
+        return True
+    return "/" in token or "\\" in token
+
+
+def _resolve_token(cwd: Path, token: str) -> Path:
+    """
+    Resolve a path token against cwd, collapsing .. before the grant compare.
+
+    :param cwd: resolved working directory as Path. Example: Path("/data/jobs/7c1e0a2e")
+    :param token: path-like argv token as str. Example: "../books/secret.md"
+    :return: absolute path as Path. Example: Path("/data/books/secret.md")
+    """
+    candidate = Path(token).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (cwd / candidate).resolve()
