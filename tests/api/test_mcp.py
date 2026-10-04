@@ -6,7 +6,9 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+import anyio
 import pytest
+from mcp.server.fastmcp import FastMCP
 
 from local_ai.blackboard.pins import Blackboard
 from local_ai.capacity.reader import CapacityReader
@@ -223,6 +225,62 @@ def test_reprioritize_running_pin_returns_not_queued(
     assert live["priority"] == 40
 
 
+def test_build_registers_four_tools_and_returns_rejected_dict(tmp_path: Path) -> None:
+    """build names the server local-ai. A rejected submit is a dict, not an exception."""
+    ollama, _calls = _scripted_ollama(tags_status=503, loaded_model=None)
+    server = _server(tmp_path, ollama=ollama)
+    mcp = server.build()
+
+    assert isinstance(mcp, FastMCP)
+    assert mcp.name == "local-ai"
+    assert _tool_names(mcp) == ["capacity", "read", "reprioritize", "submit"]
+    rejected = _call_tool(
+        mcp,
+        "submit",
+        {"goal": "Write a brief.", "done_when": "brief.md exists", "priority": 40, "model": "qwen-14b"},
+    )
+    capacity = _call_tool(mcp, "capacity", {})
+
+    assert set(rejected) == set(_contract("submit_rejected.json"))
+    assert rejected["status"] == "rejected"
+    assert rejected["reason"] == "ollama_down"
+    assert rejected["task_id"] is None
+    assert set(capacity) == set(_contract("capacity_down.json"))
+
+
+def test_build_in_process_calls_match_contract_keys(tmp_path: Path) -> None:
+    """In-process tool calls return the section 18 keys for up, queued, running, and reprioritize."""
+    server = _server(tmp_path, script=_HOLD_SCRIPT)
+    mcp = server.build()
+    try:
+        queued = _call_tool(
+            mcp,
+            "submit",
+            {"goal": "Write a brief.", "done_when": "brief.md exists", "priority": 40, "model": "qwen-14b"},
+        )
+        read_body = _call_tool(mcp, "read", {"task_id": queued["task_id"]})
+        second = _call_tool(
+            mcp,
+            "submit",
+            {"goal": "Write the second brief.", "done_when": "brief.md exists", "priority": 80, "model": "qwen-14b"},
+        )
+        changed = _call_tool(mcp, "reprioritize", {"task_id": second["task_id"], "priority": 5})
+        rejected = _call_tool(mcp, "reprioritize", {"task_id": queued["task_id"], "priority": 5})
+        capacity = _call_tool(mcp, "capacity", {})
+    finally:
+        _join_slot(server)
+
+    assert set(queued) == set(_contract("submit_queued.json"))
+    assert queued["status"] == "queued"
+    assert set(read_body) == set(_contract("read_running.json"))
+    assert read_body["status"] == "running"
+    assert set(changed) == set(_contract("reprioritize_queued.json"))
+    assert changed["status"] == "queued"
+    assert set(rejected) == set(_contract("reprioritize_rejected.json"))
+    assert rejected["status"] == "rejected"
+    assert set(capacity) == set(_contract("capacity_up.json"))
+
+
 class _CountingReader(CapacityReader):
     """Real CapacityReader that counts read calls."""
 
@@ -324,6 +382,47 @@ def _scripted_ollama(tags_status: int, loaded_model: str | None) -> tuple[Http, 
         raise AssertionError(url)
 
     return ollama, calls
+
+
+def _tool_names(mcp: FastMCP) -> list[str]:
+    """
+    List registered tool names.
+
+    :param mcp: server as FastMCP. Example: a server named "local-ai"
+    :return: sorted names as list[str]. Example: ["capacity", "read", "reprioritize", "submit"]
+    """
+    tools = anyio.run(mcp.list_tools)
+    return sorted(tool.name for tool in tools)
+
+
+def _call_tool(mcp: FastMCP, name: str, arguments: dict) -> dict:
+    """
+    Call one registered tool in-process and return its dict.
+
+    :param mcp: server as FastMCP. Example: a server named "local-ai"
+    :param name: tool name as str. Example: "submit"
+    :param arguments: tool arguments as dict. Example: {"goal": "Write a brief.", "done_when": "brief.md exists"}
+    :return: tool body as dict. Example: {"status": "rejected", "reason": "ollama_down", "task_id": None}
+    """
+    result = anyio.run(mcp.call_tool, name, arguments)
+    return _dict_from_tool(result)
+
+
+def _dict_from_tool(result: object) -> dict:
+    """
+    Unwrap a FastMCP tool result into the dict the method returned.
+
+    :param result: call_tool result as object. Example: a list of text content
+    :return: body as dict. Example: {"status": "ok"}
+    :raises AssertionError: when the result is not a dict payload. Example: None
+    """
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
+        return result[1]
+    if isinstance(result, list) and result and hasattr(result[0], "text"):
+        return json.loads(result[0].text)
+    raise AssertionError(f"tool result was {type(result).__name__}")
 
 
 def _kick_count(caplog: pytest.LogCaptureFixture) -> int:

@@ -6,6 +6,8 @@ import sqlite3
 from collections.abc import Mapping
 from typing import TypeVar
 
+from mcp.server.fastmcp import FastMCP
+
 from local_ai.capacity.reader import (
     CapacityReader,
     HttpReader,
@@ -22,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 _HTTP_PORT_ENV = "LOCAL_AI_HTTP_PORT"
 _STATUS_QUEUED = "queued"
+_SERVER_NAME = "local-ai"
+_LOOPBACK_HOST = "127.0.0.1"
 _ReaderT = TypeVar("_ReaderT")
 
 # Worker is constructed in main and passed to Slot. Service does not import it.
@@ -68,16 +72,17 @@ class LocalAiServer:
         self._pressure = pressure
         self._ollama_host = ollama_host
 
-    def build(self):
+    def build(self) -> FastMCP:
         """
         Register the four tools on a FastMCP server.
 
         :return: FastMCP server. Example: a server named "local-ai"
         """
-        # Import FastMCP here only if module-level import is already done in this module.
-        # Register capacity, submit, read, and reprioritize.
-        # Each tool returns the dict from the matching method. A rejected dict is not an exception.
-        raise NotImplementedError
+        logger.info("build | entry | name=%s", _SERVER_NAME)
+        mcp = FastMCP(_SERVER_NAME, host=_LOOPBACK_HOST)
+        _register_tools(mcp, self)
+        logger.info("build | exit | tools=capacity,submit,read,reprioritize")
+        return mcp
 
     def capacity(self) -> dict:
         """
@@ -227,6 +232,20 @@ def _integer_port(raw: object) -> int:
         raise ValueError("LOCAL_AI_HTTP_PORT must be an integer. Example: 8765") from exc
     logger.info("http_port_from_env | port=%s", port)
     return port
+
+
+def _register_tools(mcp: FastMCP, server: "LocalAiServer") -> None:
+    """
+    Register the four tools. Each returns its dict, including a rejection.
+
+    :param mcp: FastMCP server as FastMCP. Example: a server named "local-ai"
+    :param server: tool owner as LocalAiServer. Example: the composed server
+    :return: None. Example: None
+    """
+    mcp.add_tool(server.capacity)
+    mcp.add_tool(server.submit)
+    mcp.add_tool(server.read)
+    mcp.add_tool(server.reprioritize)
 
 
 def _submit_request(
