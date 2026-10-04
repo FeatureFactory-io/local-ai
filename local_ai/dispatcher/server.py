@@ -1,12 +1,19 @@
 """FastMCP tools. Each tool calls DispatcherService or CapacityReader and returns the dict."""
 
+import logging
+import os
 import sqlite3
+from collections.abc import Mapping
 
 from local_ai.capacity.reader import CapacityReader
 from local_ai.dispatcher.service import DispatcherService
 from local_ai.dispatcher.slot import Slot
 from local_ai.worker.loop import Worker
 
+
+logger = logging.getLogger(__name__)
+
+_HTTP_PORT_ENV = "LOCAL_AI_HTTP_PORT"
 
 # Worker is constructed in main and passed to Slot. Service does not import it.
 COMPOSER_WORKER = Worker
@@ -130,8 +137,44 @@ def http_port_from_env(env: dict[str, str] | None = None) -> int | None:
     :param env: environment as dict[str, str] | None. Example: {"LOCAL_AI_HTTP_PORT": "8765"}
     :return: port or None as int | None. Example: 8765
     :raises ValueError: when the variable is not an integer. Example: "abc"
+    :raises TypeError: when env is not a mapping. Example: []
     """
-    # Read LOCAL_AI_HTTP_PORT from env or os.environ.
-    # Empty or missing returns None.
-    # A present value must be an integer port. Do not bind a socket here.
-    raise NotImplementedError
+    source = _port_environment(env)
+    raw = source.get(_HTTP_PORT_ENV)
+    if raw is None or raw == "":
+        logger.info("http_port_from_env | unset")
+        return None
+    return _integer_port(raw)
+
+
+def _port_environment(env: Mapping[str, str] | None) -> Mapping[str, str]:
+    """
+    Use the passed mapping, or the process environment when env is omitted.
+
+    :param env: environment as Mapping[str, str] | None. Example: {"LOCAL_AI_HTTP_PORT": "8765"}
+    :return: mapping to read as Mapping[str, str]. Example: {"LOCAL_AI_HTTP_PORT": "8765"}
+    :raises TypeError: when env is not a mapping. Example: []
+    """
+    if env is None:
+        return os.environ
+    if not isinstance(env, Mapping):
+        raise TypeError("env must be a mapping. Example: {'LOCAL_AI_HTTP_PORT': '8765'}")
+    return env
+
+
+def _integer_port(raw: object) -> int:
+    """
+    Parse a port string. This does not open a socket.
+
+    :param raw: environment value as object. Example: "8765"
+    :return: port as int. Example: 8765
+    :raises ValueError: when raw is not an integer string. Example: "abc"
+    """
+    if isinstance(raw, bool) or not isinstance(raw, str):
+        raise ValueError("LOCAL_AI_HTTP_PORT must be an integer. Example: 8765")
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValueError("LOCAL_AI_HTTP_PORT must be an integer. Example: 8765") from exc
+    logger.info("http_port_from_env | port=%s", port)
+    return port
