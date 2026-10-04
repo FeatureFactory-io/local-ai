@@ -116,6 +116,17 @@ def test_run_creates_a_file_in_the_job_directory(tmp_path: Path) -> None:
     assert not (tmp_path / "kept.txt").exists()
 
 
+def test_run_heredoc_writes_the_file_in_the_job_directory(tmp_path: Path) -> None:
+    """A redirect and a heredoc run in a shell, not as separate cat arguments."""
+    tool, grant, job_dir = _job_shell(tmp_path)
+    command = "cat > poem.md <<'EOF'\npython\nEOF\n"
+
+    envelope = tool.run(grant, command, job_dir)
+
+    assert envelope.success is True, envelope.error
+    assert (job_dir / "poem.md").read_text(encoding="utf-8") == "python\n"
+
+
 def test_run_empty_command_does_not_start(tmp_path: Path) -> None:
     """A blank command returns an envelope and does not create shell.log."""
     tool, grant, job_dir = _job_shell(tmp_path)

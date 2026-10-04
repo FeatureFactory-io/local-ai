@@ -50,7 +50,7 @@ class ShellTool:
         denied = self._denied_envelope(grant, job_dir, argv)
         if denied is not None:
             return denied
-        return _finish(_start_process(argv, job_dir), job_dir)
+        return _finish(_start_process(command, job_dir), job_dir)
 
     def _denied_envelope(
         self,
@@ -113,16 +113,17 @@ def _parse_argv(command: str) -> tuple[str, ...] | ToolEnvelope:
     return argv
 
 
-def _start_process(argv: tuple[str, ...], job_dir: Path) -> subprocess.CompletedProcess[str]:
+def _start_process(command: str, job_dir: Path) -> subprocess.CompletedProcess[str]:
     """
-    Run argv in the job directory and capture both streams.
+    Run the command in a shell so redirects and heredocs work.
 
-    A missing program becomes exit 127 so the worker receives an envelope.
+    The grant check already inspected the tokens. A missing program is exit 127 from the shell.
 
-    :param argv: command tokens as tuple[str, ...]. Example: ("printf", "%s", "hello")
+    :param command: shell command as str. Example: "printf %s hello"
     :param job_dir: working directory as Path. Example: Path("data/jobs/7c1e0a2e")
     :return: completed process as subprocess.CompletedProcess[str]. Example: returncode 0 and stdout "hello"
     """
+    argv = ("/bin/sh", "-c", command)
     try:
         return subprocess.run(
             argv,
