@@ -4,13 +4,15 @@ import json
 import logging
 import sqlite3
 
-from local_ai.contracts import AccessGrant, ReasoningNote, TaskPin
+from local_ai.contracts import REASONING_CAP, AccessGrant, ReasoningNote, TaskPin
 from local_ai.db.database import Database
 
 
 logger = logging.getLogger(__name__)
 
 _QUEUED = "queued"
+_TRUNCATION_TEXT = "earlier notes were truncated"
+_TRUNCATION_AT = "2026-10-04T00:00:00Z"
 
 _LIST_QUEUED_SQL = """
 SELECT * FROM tasks
@@ -95,6 +97,8 @@ class Blackboard:
     ) -> None:
         """
         Append one note. A bad note leaves the previous text in place.
+
+        Notes past 32_000 characters drop the oldest and keep a truncation marker.
 
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
@@ -524,7 +528,36 @@ def _append_parsed_note(
         logger.info("blackboard.append kept previous task_id=%s", task_id)
         return
     notes.append(parsed)
-    _write_reasoning(connection, task_id, json.dumps(notes))
+    _write_reasoning(connection, task_id, _capped_reasoning(notes, task_id))
+
+
+def _capped_reasoning(notes: list[dict[str, object]], task_id: str) -> str:
+    """
+    Drop oldest notes once the JSON would pass the board cap, and keep one marker.
+
+    :param notes: note objects newest last as list. Example: [{"at": "2026-10-04T18:40:01Z", "step": 2, "text": "Reading ch-04.md."}]
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: reasoning JSON as str. Example: "[]"
+    """
+    encoded = json.dumps(notes)
+    if len(encoded) <= REASONING_CAP:
+        return encoded
+    logger.info("blackboard.append truncated task_id=%s", task_id)
+    kept = [note for note in notes if note.get("text") != _TRUNCATION_TEXT]
+    while kept and len(_dump_with_marker(kept)) > REASONING_CAP:
+        kept.pop(0)
+    return _dump_with_marker(kept)
+
+
+def _dump_with_marker(notes: list[dict[str, object]]) -> str:
+    """
+    Put the truncation marker ahead of the notes that still fit.
+
+    :param notes: kept notes as list. Example: [{"at": "2026-10-04T18:41:00Z", "step": 2, "text": "newest"}]
+    :return: reasoning JSON as str. Example: '[{"at": "2026-10-04T00:00:00Z", "step": 0, "text": "earlier notes were truncated"}]'
+    """
+    marker: dict[str, object] = {"at": _TRUNCATION_AT, "step": 0, "text": _TRUNCATION_TEXT}
+    return json.dumps([marker, *notes])
 
 
 def _incoming_note(note: ReasoningNote | None) -> dict[str, object] | None:

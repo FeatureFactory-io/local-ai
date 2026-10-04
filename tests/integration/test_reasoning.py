@@ -1,5 +1,6 @@
 """A reasoning note that cannot be parsed leaves the previous pin text."""
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from local_ai.blackboard.pins import Blackboard
-from local_ai.contracts import AccessGrant, ReasoningNote, TaskPin
+from local_ai.contracts import REASONING_CAP, AccessGrant, ReasoningNote, TaskPin
 from local_ai.db.database import Database
 from tests.support.log_story import assert_log_story
 
@@ -60,6 +61,33 @@ def test_append_reasoning_malformed_column_keeps_previous_text(
 
     assert _reasoning_text(connection) == malformed
     assert_log_story(caplog.records, "blackboard.append", "entry", [f"task_id={_TASK_ID}"])
+
+
+def test_append_reasoning_drops_oldest_notes_past_cap(tmp_path: Path) -> None:
+    """Notes past 32_000 characters drop the oldest and keep a truncation marker."""
+    board, connection = _open_board(tmp_path)
+    board.insert_pin(connection, _pin())
+    oldest = "oldest-note-" + ("a" * 1_000)
+    for index in range(40):
+        text = oldest if index == 0 else f"note-{index}-" + ("b" * 1_000)
+        board.append_reasoning(
+            connection,
+            _TASK_ID,
+            ReasoningNote(f"2026-10-04T18:40:{index:02d}Z", 1, text),
+        )
+    newest = "newest-note-" + ("c" * 500)
+    board.append_reasoning(
+        connection,
+        _TASK_ID,
+        ReasoningNote("2026-10-04T18:41:00Z", 2, newest),
+    )
+
+    stored = _reasoning_text(connection)
+    notes = json.loads(stored)
+    assert len(stored) <= REASONING_CAP
+    assert notes[0]["text"] == "earlier notes were truncated"
+    assert notes[-1]["text"] == newest
+    assert all(note["text"] != oldest for note in notes)
 
 
 def _open_board(tmp_path: Path) -> tuple[Blackboard, sqlite3.Connection]:
