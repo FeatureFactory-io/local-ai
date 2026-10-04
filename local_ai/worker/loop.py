@@ -18,6 +18,7 @@ from local_ai.contracts import (
     PlanStep,
     StepDraft,
     TaskPin,
+    ToolCall,
     ToolEnvelope,
 )
 from local_ai.llm.port import LlmPort, split_note
@@ -75,6 +76,8 @@ class Worker:
         self._failed_command: str | None = None
         self._failed_error = ""
         self._identical: dict[str, tuple[str, int]] = {}
+        self._seed_command: str | None = None
+        self.failure_reason = ""
         self.trace: list[dict[str, str]] = []
 
     def run_task(self, task_id: str) -> str:
@@ -87,7 +90,9 @@ class Worker:
         """
         logger.info("Starting run_task task_id=%s", task_id)
         _require_task_id(task_id)
+        self.failure_reason = ""
         if not self._store_planned_steps(task_id):
+            self.failure_reason = "empty_plan"
             return "failed"
         outcome = self._run_pending_steps(task_id, self._require_pin(task_id).model)
         logger.info("worker.task | finished | task_id=%s status=%s", task_id, outcome)
@@ -142,6 +147,9 @@ class Worker:
         logger.info("Starting run_step task_id=%s step=%s", task_id, order)
         _require_step_args(task_id, order, model_name)
         self._open_step(task_id, order)
+        seeded = self._run_seed_command(task_id, order)
+        if seeded is not None:
+            return seeded
         for _round_index in range(_ROUNDS):
             outcome = self._one_step_round(task_id, order, model_name)
             if outcome is not None:
@@ -416,10 +424,48 @@ class Worker:
         try:
             drafts = self.parse_plan(completion)
         except ValueError:
-            logger.info("worker.task | failed | task_id=%s reason=empty_plan", task_id)
-            return False
+            drafts = self._draft_from_shell(completion)
+            if drafts is None:
+                logger.info("worker.task | failed | task_id=%s reason=empty_plan", task_id)
+                return False
         self._plan.insert_steps(self._connection, task_id, drafts)
         return True
+
+    def _draft_from_shell(self, completion: Completion) -> tuple[StepDraft, ...] | None:
+        """
+        Turn a planning tool call into one step when the model skipped the numbered plan.
+
+        :param completion: planning turn as Completion. Example: Completion(tool_calls=(ToolCall("shell", "printf marker"),))
+        :return: one draft or None as tuple[StepDraft, ...] | None. Example: (StepDraft(1, "Run the shell command from the planning turn"),)
+        """
+        command = _shell_command(completion)
+        if not command:
+            return None
+        self._seed_command = command
+        logger.info("worker.task | plan_from_shell")
+        return (StepDraft(1, "Run the shell command from the planning turn"),)
+
+    def _run_seed_command(self, task_id: str, order: int) -> str | None:
+        """
+        Run the shell command captured during planning, then finish that step.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 1
+        :return: step outcome or None as str | None. Example: "completed"
+        """
+        command = self._seed_command
+        if not command:
+            return None
+        self._seed_command = None
+        self._run_requested_shell(
+            task_id,
+            order,
+            Completion(tool_calls=(ToolCall("shell", command),)),
+        )
+        if _shell_failed(self._round_had_shell, self._last_envelope):
+            error = self._last_envelope.error if self._last_envelope is not None else ""
+            return self._fail_open_step(task_id, order, error)
+        return self._complete_open_step(task_id, order, "Ran the shell command from the planning turn")
 
     def _planning_prompt(self, pin: TaskPin) -> str:
         """

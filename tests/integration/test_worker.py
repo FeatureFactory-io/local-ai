@@ -315,13 +315,29 @@ def test_run_task_happy_path_records_agent_story(
 
 
 def test_run_task_with_empty_plan_returns_failed(tmp_path: Path) -> None:
-    """A planning turn with no numbered step fails the pin before any step runs."""
+    """A planning turn with no numbered step and no shell call fails before any step runs."""
     worker, connection, _job_dir = _open_worker(tmp_path, (Completion(content="I cannot plan"),))
 
     outcome = worker.run_task(_TASK_ID)
 
     assert outcome == "failed"
+    assert worker.failure_reason == "empty_plan"
     assert _steps(worker, connection) == ()
+
+
+def test_run_task_with_shell_tool_and_no_numbered_plan_runs_that_command(tmp_path: Path) -> None:
+    """A planning turn that is only a shell call writes the file and completes."""
+    command = "python3 -c \"open('poem.md','w').write('python\\n')\""
+    worker, connection, job_dir = _open_worker(
+        tmp_path,
+        (Completion(thinking="Writing poem.md.", tool_calls=(ToolCall("shell", command),)),),
+    )
+
+    outcome = worker.run_task(_TASK_ID)
+
+    assert outcome == "completed"
+    assert (job_dir / "poem.md").read_text(encoding="utf-8") == "python\n"
+    assert [(step.order, step.status) for step in _steps(worker, connection)] == [(1, "completed")]
 
 
 def test_run_task_stops_on_third_identical_failure(tmp_path: Path) -> None:

@@ -123,7 +123,7 @@ class Slot:
             logger.info("dispatcher.slot | worker_raised | task_id=%s", task_id)
             return _STATUS_FAILED, _exception_text(exc)
         logger.info("dispatcher.slot | worker_returned | task_id=%s status=%s", task_id, status)
-        return _status_and_error(status)
+        return _status_and_error(status, _failure_reason(self._runner))
 
     def _finish_pin(self, task_id: str, status: str, error: str) -> None:
         """
@@ -146,20 +146,35 @@ class Slot:
         self.kick()
 
 
-def _status_and_error(status: str) -> tuple[str, str]:
+def _status_and_error(status: str, reason: str = "") -> tuple[str, str]:
     """
     Accept completed or failed. Anything else is stored as failed.
 
-    A failed return stores a short error. An unexpected status stores its own explanation.
+    A failed return stores the worker's failure_reason when it set one.
 
     :param status: worker result as str. Example: "failed"
-    :return: status and error as tuple[str, str]. Example: ("failed", "run_task returned failed")
+    :param reason: worker failure_reason as str. Example: "empty_plan"
+    :return: status and error as tuple[str, str]. Example: ("failed", "empty_plan")
     """
     if status == _STATUS_COMPLETED:
         return _STATUS_COMPLETED, ""
     if status == _STATUS_FAILED:
-        return _STATUS_FAILED, _FAILED_RETURN
+        text = reason.strip() or _FAILED_RETURN
+        return _STATUS_FAILED, text
     return _STATUS_FAILED, f"unexpected worker status {status!r}"
+
+
+def _failure_reason(runner: object) -> str:
+    """
+    Read failure_reason when the runner recorded one.
+
+    :param runner: worker as object. Example: Worker(...)
+    :return: reason as str. Example: "empty_plan"
+    """
+    reason = getattr(runner, "failure_reason", "")
+    if not isinstance(reason, str):
+        return ""
+    return reason
 
 
 def _exception_text(exc: Exception) -> str:
