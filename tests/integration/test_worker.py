@@ -205,6 +205,40 @@ def test_run_step_with_empty_force_final_returns_failed(tmp_path: Path) -> None:
     assert _steps(worker, connection)[0].status == "running"
 
 
+def test_note_identical_failure_third_same_command_returns_true(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The third identical command stops the pin. The command text stays out of the log."""
+    worker, _connection, _job_dir = _open_worker(tmp_path, ())
+    command = "weasyprint book.html book.pdf"
+    caplog.set_level(logging.INFO)
+
+    first = worker.note_identical_failure(_TASK_ID, 2, command)
+    second = worker.note_identical_failure(_TASK_ID, 2, command)
+    third = worker.note_identical_failure(_TASK_ID, 2, command)
+
+    assert (first, second, third) == (False, False, True)
+    assert_log_story(
+        caplog.records,
+        "worker.failure",
+        "identical",
+        [f"task_id={_TASK_ID}", "step=2", "count=3"],
+    )
+    assert command not in caplog.text
+
+
+def test_note_identical_failure_different_command_resets_count(tmp_path: Path) -> None:
+    """A different command starts the count again at one."""
+    worker, _connection, _job_dir = _open_worker(tmp_path, ())
+
+    assert worker.note_identical_failure(_TASK_ID, 2, "printf a") is False
+    assert worker.note_identical_failure(_TASK_ID, 2, "printf a") is False
+    assert worker.note_identical_failure(_TASK_ID, 2, "printf b") is False
+    assert worker.note_identical_failure(_TASK_ID, 2, "printf b") is False
+    assert worker.note_identical_failure(_TASK_ID, 2, "printf b") is True
+
+
 def _open_worker(
     tmp_path: Path,
     script: tuple[Completion, ...],

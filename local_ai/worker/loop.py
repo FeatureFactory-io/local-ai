@@ -1,5 +1,6 @@
 """Agent loop for the one running task. The slot calls run_task. This module does not import dispatcher."""
 
+import hashlib
 import json
 import logging
 import re
@@ -73,6 +74,7 @@ class Worker:
         self._step_envelope: ToolEnvelope | None = None
         self._failed_command: str | None = None
         self._failed_error = ""
+        self._identical: dict[str, tuple[str, int]] = {}
         self.trace: list[dict[str, str]] = []
 
     def run_task(self, task_id: str) -> str:
@@ -186,12 +188,13 @@ class Worker:
         :param order: step order as int. Example: 2
         :param command: shell command as str. Example: "weasyprint book.html book.pdf"
         :return: True when the pin must stop as bool. Example: False
+        :raises ValueError: when task_id, order, or command is unusable. Example: ""
         """
-        # Compare command to the previous failure on this step.
-        # At MAX_IDENTICAL_FAILURES (3), return True. Otherwise return False.
-        # A different command resets the count.
-        # Log the count at INFO. Do not log the command text beyond a short hash or length.
-        raise NotImplementedError
+        logger.info("Starting note_identical_failure task_id=%s step=%s", task_id, order)
+        _require_failure_args(task_id, order, command)
+        count = self._next_failure_count(task_id, command)
+        _log_failure_count(task_id, order, command, count)
+        return count >= _IDENTICAL
 
     def _append_note(self, task_id: str, order: int, completion: Completion) -> None:
         """
@@ -385,9 +388,58 @@ class Worker:
         logger.info("worker.step | failed | task_id=%s step=%s", task_id, order)
         return "failed"
 
+    def _next_failure_count(self, task_id: str, command: str) -> int:
+        """
+        Increment the count when the command matches. A new command starts at one.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param command: shell command as str. Example: "weasyprint book.html book.pdf"
+        :return: count as int. Example: 3
+        """
+        previous, count = self._identical.get(task_id, ("", 0))
+        count = count + 1 if command == previous else 1
+        self._identical[task_id] = (command, count)
+        return count
+
 
 _ROUNDS = MAX_ROUNDS_PER_STEP
 _IDENTICAL = MAX_IDENTICAL_FAILURES
+
+
+def _require_failure_args(task_id: str, order: int, command: str) -> None:
+    """
+    Reject a failure note that cannot be counted.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param order: step order as int. Example: 2
+    :param command: shell command as str. Example: "weasyprint book.html book.pdf"
+    :return: None. Example: None
+    :raises ValueError: when task_id, order, or command is unusable. Example: ""
+    """
+    _require_step_args(task_id, order, "qwen-14b")
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("command must be a non-empty str. Example: 'weasyprint book.html book.pdf'")
+
+
+def _log_failure_count(task_id: str, order: int, command: str, count: int) -> None:
+    """
+    Log the count, the length, and a short hash. The command text stays out.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param order: step order as int. Example: 2
+    :param command: shell command as str. Example: "weasyprint book.html book.pdf"
+    :param count: identical-failure count as int. Example: 3
+    :return: None. Example: None
+    """
+    digest = hashlib.sha256(command.encode("utf-8")).hexdigest()[:12]
+    logger.info(
+        "worker.failure | identical | task_id=%s step=%s count=%s command_len=%s command_hash=%s",
+        task_id,
+        order,
+        count,
+        len(command),
+        digest,
+    )
 
 
 def _require_step_args(task_id: str, order: int, model_name: str) -> None:
