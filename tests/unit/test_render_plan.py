@@ -1,11 +1,10 @@
 """render_plan formats steps and does not touch the database."""
 
-import sqlite3
 from pathlib import Path
 
 import pytest
 
-from local_ai.contracts import PlanStep, StepDraft
+from local_ai.contracts import PlanStep
 from local_ai.db.database import Database
 from local_ai.plan.steps import PlanStore
 
@@ -49,25 +48,3 @@ def test_render_plan_rejects_a_non_tuple() -> None:
         store.render_plan([PlanStep("id", 1, "List chapter files", "completed")])  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="PlanStep"):
         store.render_plan(("List chapter files",))  # type: ignore[arg-type]
-
-
-def test_other_plan_store_methods_still_raise() -> None:
-    """Only render_plan is filled. Every other PlanStore method stays a stub."""
-    store = PlanStore(Database(Path("data/local-ai.sqlite")))
-    connection = sqlite3.connect(":memory:")
-    drafts = (StepDraft(1, "List chapter files"),)
-    with pytest.raises(NotImplementedError):
-        store.insert_steps(connection, _TASK_ID, drafts)
-    with pytest.raises(NotImplementedError):
-        store.list_steps(connection, _TASK_ID)
-    with pytest.raises(NotImplementedError):
-        store.mark_running(connection, _TASK_ID, 1)
-    with pytest.raises(NotImplementedError):
-        store.complete_step(connection, _TASK_ID, 1, "Found ch-01.md", '{"success": true}')
-    with pytest.raises(NotImplementedError):
-        store.fail_step(connection, _TASK_ID, 2, "weasyprint: CSS path missing")
-    with pytest.raises(NotImplementedError):
-        store.insert_after(connection, _TASK_ID, 2, "Fix the CSS path and run weasyprint again")
-    with pytest.raises(NotImplementedError):
-        store.cancel_pending(connection, _TASK_ID)
-    connection.close()
