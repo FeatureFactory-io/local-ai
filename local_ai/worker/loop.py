@@ -1,5 +1,6 @@
 """Agent loop for the one running task. The slot calls run_task. This module does not import dispatcher."""
 
+import json
 import logging
 import re
 import sqlite3
@@ -13,6 +14,7 @@ from local_ai.contracts import (
     AccessGrant,
     Completion,
     ReasoningNote,
+    PlanStep,
     StepDraft,
     TaskPin,
     ToolEnvelope,
@@ -68,6 +70,9 @@ class Worker:
         self._last_envelope: ToolEnvelope | None = None
         self._last_command: str | None = None
         self._round_had_shell = False
+        self._step_envelope: ToolEnvelope | None = None
+        self._failed_command: str | None = None
+        self._failed_error = ""
         self.trace: list[dict[str, str]] = []
 
     def run_task(self, task_id: str) -> str:
@@ -130,16 +135,16 @@ class Worker:
         :param order: step order as int. Example: 2
         :param model_name: logical size as str. Example: "qwen-14b"
         :return: step outcome as str. Example: "completed"
+        :raises ValueError: when task_id, order, or model_name is unusable. Example: ""
         """
-        # PlanStore.mark_running. Blackboard phase acting.
-        # Loop at most MAX_ROUNDS_PER_STEP (12) times:
-        #   PromptAssembler.assemble including the previous step's llm_synthesis.
-        #   run_round.
-        #   A final_answer calls PlanStore.complete_step and returns "completed".
-        #   A failed shell returns "failed" after PlanStore.fail_step.
-        #   No tool and no final answer calls force_final once.
-        # If the loop ends with no final answer, fail the step and return "failed".
-        raise NotImplementedError
+        logger.info("Starting run_step task_id=%s step=%s", task_id, order)
+        _require_step_args(task_id, order, model_name)
+        self._open_step(task_id, order)
+        for _round_index in range(_ROUNDS):
+            outcome = self._one_step_round(task_id, order, model_name)
+            if outcome is not None:
+                return outcome
+        return self._fail_open_step(task_id, order, "max rounds without a final answer")
 
     def force_final(self, task_id: str, order: int, model_name: str) -> str:
         """
@@ -235,6 +240,7 @@ class Worker:
         job_dir = _job_dir(self._connection, task_id)
         envelope = self._shell.run(_shell_grant(pin, job_dir), command, job_dir)
         self._last_envelope = envelope
+        self._step_envelope = envelope
         self._last_command = command
         self.trace.append({"tool": "shell"})
         logger.info("worker.step | acting | task_id=%s step=%s tool=shell", task_id, order)
@@ -252,9 +258,161 @@ class Worker:
             raise ValueError(f"pin not found task_id={task_id}")
         return pin
 
+    def _open_step(self, task_id: str, order: int) -> None:
+        """
+        Mark the step running and publish the acting phase.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :return: None. Example: None
+        """
+        self._failed_command = None
+        self._failed_error = ""
+        self._step_envelope = None
+        self._plan.mark_running(self._connection, task_id, order)
+        self._publish_phase(task_id, "acting")
+
+    def _one_step_round(self, task_id: str, order: int, model_name: str) -> str | None:
+        """
+        Take one round. Return a terminal outcome, or None to continue.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :param model_name: logical size as str. Example: "qwen-14b"
+        :return: outcome or None as str | None. Example: "completed"
+        """
+        completion = self.run_round(task_id, order, self._step_prompt(task_id, order), model_name)
+        if _shell_failed(self._round_had_shell, self._last_envelope):
+            error = self._last_envelope.error if self._last_envelope is not None else ""
+            return self._fail_open_step(task_id, order, error)
+        if completion.final_answer.strip():
+            return self._complete_open_step(task_id, order, completion.final_answer.strip())
+        if not self._round_had_shell:
+            return self.force_final(task_id, order, model_name)
+        return None
+
+    def _step_prompt(self, task_id: str, order: int) -> str:
+        """
+        Assemble the step prompt, including the previous synthesis.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :return: prompt as str. Example: "Foundation\\nShell\\nTask"
+        """
+        pin = self._require_pin(task_id)
+        steps = self._plan.list_steps(self._connection, task_id)
+        return self._prompt.assemble(
+            pin.goal,
+            pin.done_when,
+            pin.access,
+            (),
+            self._plan.render_plan(steps),
+            _prior_synthesis(steps, order),
+        )
+
+    def _publish_phase(self, task_id: str, phase: str) -> None:
+        """
+        Write the phase and the readable plan onto the pin.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param phase: phase word as str. Example: "acting"
+        :return: None. Example: None
+        """
+        plan_text = self._plan.render_plan(self._plan.list_steps(self._connection, task_id))
+        self._blackboard.set_phase(self._connection, task_id, phase, plan_text)
+        if phase == "planning":
+            self.trace.append({"workflow": "planning"})
+
+    def _complete_open_step(self, task_id: str, order: int, synthesis: str) -> str:
+        """
+        Store the handoff and record the completed step.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :param synthesis: next-step handoff as str. Example: "Found ch-01.md"
+        :return: "completed" as str. Example: "completed"
+        """
+        self._plan.complete_step(
+            self._connection,
+            task_id,
+            order,
+            synthesis,
+            _envelope_json(self._step_envelope),
+        )
+        self.trace.append({"effect": "step_completed"})
+        logger.info("worker.step | completed | task_id=%s step=%s", task_id, order)
+        return "completed"
+
+    def _fail_open_step(self, task_id: str, order: int, error: str) -> str:
+        """
+        Mark the running step failed. A failed shell remembers the command.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :param error: step error as str. Example: "boom"
+        :return: "failed" as str. Example: "failed"
+        """
+        self._plan.fail_step(self._connection, task_id, order, error)
+        if _shell_failed(self._round_had_shell, self._last_envelope) and self._last_command is not None:
+            self._failed_command = self._last_command
+            self._failed_error = error
+        logger.info("worker.step | failed | task_id=%s step=%s", task_id, order)
+        return "failed"
+
 
 _ROUNDS = MAX_ROUNDS_PER_STEP
 _IDENTICAL = MAX_IDENTICAL_FAILURES
+
+
+def _require_step_args(task_id: str, order: int, model_name: str) -> None:
+    """
+    Reject a step address the plan store cannot mark running.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param order: step order as int. Example: 2
+    :param model_name: logical size as str. Example: "qwen-14b"
+    :return: None. Example: None
+    :raises ValueError: when task_id, order, or model_name is unusable. Example: ""
+    """
+    _require_round_args(task_id, order, "", model_name)
+
+
+def _shell_failed(had_shell: bool, envelope: ToolEnvelope | None) -> bool:
+    """
+    Return whether this round's shell command failed.
+
+    :param had_shell: whether the round ran the shell as bool. Example: True
+    :param envelope: tool envelope as ToolEnvelope | None. Example: ToolEnvelope(False, "", "boom")
+    :return: True when the shell failed as bool. Example: True
+    """
+    return had_shell and envelope is not None and not envelope.success
+
+
+def _prior_synthesis(steps: tuple[PlanStep, ...], order: int) -> str:
+    """
+    Use the latest handoff from a step before this one.
+
+    :param steps: ordered steps as tuple[PlanStep, ...]. Example: ()
+    :param order: current step order as int. Example: 2
+    :return: synthesis as str. Example: "Found ch-01.md"
+    """
+    prior = ""
+    for step in steps:
+        if step.order < order and step.llm_synthesis:
+            prior = step.llm_synthesis
+    return prior
+
+
+def _envelope_json(envelope: ToolEnvelope | None) -> str:
+    """
+    Encode a tool envelope for the step row. None becomes an empty string.
+
+    :param envelope: tool envelope as ToolEnvelope | None. Example: ToolEnvelope(True, "marker", "")
+    :return: JSON or empty as str. Example: '{"success": true, "result": "marker", "error": ""}'
+    """
+    if envelope is None:
+        return ""
+    return json.dumps({"success": envelope.success, "result": envelope.result, "error": envelope.error})
 
 
 def _require_round_args(task_id: str, order: int, prompt: str, model_name: str) -> None:

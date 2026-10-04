@@ -8,7 +8,15 @@ from pathlib import Path
 import pytest
 
 from local_ai.blackboard.pins import Blackboard
-from local_ai.contracts import AccessGrant, Completion, StepDraft, TaskPin, ToolCall, ToolEnvelope
+from local_ai.contracts import (
+    MAX_ROUNDS_PER_STEP,
+    AccessGrant,
+    Completion,
+    StepDraft,
+    TaskPin,
+    ToolCall,
+    ToolEnvelope,
+)
 from local_ai.db.database import Database
 from local_ai.llm.port import ScriptedLLM
 from local_ai.plan.steps import PlanStore
@@ -100,6 +108,54 @@ def test_run_round_with_failing_shell_keeps_the_envelope(tmp_path: Path) -> None
     assert (job_dir / "shell.log").read_text(encoding="utf-8") == "boom"
 
 
+def test_run_step_with_final_answer_completes(tmp_path: Path) -> None:
+    """A final answer marks the running step completed and stores the handoff."""
+    turn = Completion(final_answer="Found ch-01.md")
+    worker, connection, _job_dir = _open_worker(tmp_path, (turn,))
+    _insert_pending(worker, connection, (StepDraft(1, "List chapter files"),))
+
+    outcome = worker.run_step(_TASK_ID, 1, "qwen-14b")
+
+    assert outcome == "completed"
+    step = _steps(worker, connection)[0]
+    assert step.status == "completed"
+    assert step.llm_synthesis == "Found ch-01.md"
+    assert _phase(worker, connection) == "acting"
+
+
+def test_run_step_with_failed_shell_fails_the_step(tmp_path: Path) -> None:
+    """A non-zero shell marks the step failed and keeps the stderr."""
+    command = "python3 -c \"import sys; sys.stderr.write('boom'); raise SystemExit(4)\""
+    turn = Completion(thinking="Running the check.", tool_calls=(ToolCall("shell", command),))
+    worker, connection, _job_dir = _open_worker(tmp_path, (turn,))
+    _insert_pending(worker, connection, (StepDraft(1, "Run the check"),))
+
+    outcome = worker.run_step(_TASK_ID, 1, "qwen-14b")
+
+    assert outcome == "failed"
+    step = _steps(worker, connection)[0]
+    assert step.status == "failed"
+    assert step.error == "boom"
+    assert worker._failed_command == command
+
+
+def test_run_step_at_round_cap_fails_the_step(tmp_path: Path) -> None:
+    """Twelve shell rounds without a final answer fail the step."""
+    turns = tuple(
+        Completion(tool_calls=(ToolCall("shell", "printf x"),))
+        for _index in range(MAX_ROUNDS_PER_STEP)
+    )
+    worker, connection, _job_dir = _open_worker(tmp_path, turns)
+    _insert_pending(worker, connection, (StepDraft(1, "Keep looking"),))
+
+    outcome = worker.run_step(_TASK_ID, 1, "qwen-14b")
+
+    assert outcome == "failed"
+    step = _steps(worker, connection)[0]
+    assert step.status == "failed"
+    assert step.error == "max rounds without a final answer"
+
+
 def _open_worker(
     tmp_path: Path,
     script: tuple[Completion, ...],
@@ -127,6 +183,42 @@ def _open_worker(
         connection,
     )
     return worker, connection, job_dir
+
+
+def _insert_pending(worker: Worker, connection: sqlite3.Connection, drafts: tuple[StepDraft, ...]) -> None:
+    """
+    Store pending steps for the open pin.
+
+    :param worker: worker under test as Worker. Example: the worker from _open_worker
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param drafts: steps as tuple[StepDraft, ...]. Example: (StepDraft(1, "List chapter files"),)
+    :return: None. Example: None
+    """
+    worker._plan.insert_steps(connection, _TASK_ID, drafts)
+
+
+def _steps(worker: Worker, connection: sqlite3.Connection):
+    """
+    Load the pin's steps in order.
+
+    :param worker: worker under test as Worker. Example: the worker from _open_worker
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :return: steps as tuple. Example: ()
+    """
+    return worker._plan.list_steps(connection, _TASK_ID)
+
+
+def _phase(worker: Worker, connection: sqlite3.Connection) -> str:
+    """
+    Return the pin phase.
+
+    :param worker: worker under test as Worker. Example: the worker from _open_worker
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :return: phase as str. Example: "acting"
+    """
+    pin = worker._blackboard.get_pin(connection, _TASK_ID)
+    assert pin is not None
+    return pin.phase
 
 
 def _reasoning(connection: sqlite3.Connection) -> str:
