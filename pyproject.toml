@@ -1,0 +1,26 @@
+[project]
+name = "local-ai"
+version = "0.0.0"
+description = "Dispatcher that hands one queued task at a time to a local Qwen worker."
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.28,<2",
+    "litellm",
+    "psutil",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["local_ai"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+log_file = "tests.log"
+log_file_level = "INFO"
+addopts = "-q"
