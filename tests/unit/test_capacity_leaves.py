@@ -53,6 +53,48 @@ def test_recommend_logs_chosen_band_at_info(caplog: pytest.LogCaptureFixture) ->
     assert any("qwen-24b" in message for message in info_messages)
 
 
+@pytest.mark.parametrize("word", ["normal", "warn", "critical"])
+def test_read_pressure_returns_accepted_word(word: str) -> None:
+    """Host pressure words pass through unchanged."""
+    assert CapacityReader().read_pressure(lambda: word) == word
+
+
+def test_read_pressure_when_reader_raises_returns_unknown() -> None:
+    """A failed host probe is unknown, so capacity can still be reported."""
+
+    def boom() -> str:
+        raise RuntimeError("memory_pressure failed")
+
+    assert CapacityReader().read_pressure(boom) == "unknown"
+
+
+def test_read_pressure_when_word_is_unexpected_returns_unknown() -> None:
+    """Only normal, warn, and critical are accepted readings."""
+    assert CapacityReader().read_pressure(lambda: "high") == "unknown"
+
+
+def test_read_pressure_logs_word_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    """The accepted word is an INFO line."""
+    caplog.set_level(logging.INFO, logger="local_ai.capacity.reader")
+    CapacityReader().read_pressure(lambda: "warn")
+    info_messages = [record.message for record in caplog.records if record.levelno == logging.INFO]
+    assert any("warn" in message for message in info_messages)
+
+
+def test_read_pressure_logs_warning_when_reader_raises(caplog: pytest.LogCaptureFixture) -> None:
+    """A raising reader is a WARNING, and the returned word is unknown."""
+    caplog.set_level(logging.INFO, logger="local_ai.capacity.reader")
+
+    def boom() -> str:
+        raise OSError("memory_pressure down")
+
+    assert CapacityReader().read_pressure(boom) == "unknown"
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+    assert any(
+        record.levelno == logging.INFO and "unknown" in record.message for record in caplog.records
+    )
+
+
 def test_read_still_raises_not_implemented() -> None:
     """Plan A fills recommend and read_pressure. read stays a stub until Plan B."""
     with pytest.raises(NotImplementedError):

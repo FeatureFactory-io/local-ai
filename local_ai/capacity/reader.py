@@ -18,6 +18,11 @@ MODEL_QWEN_24B = "qwen-24b"
 MODEL_QWEN_14B = "qwen-14b"
 MODEL_QWEN_8B = "qwen-8b"
 RECOMMENDATION_NONE = "none"
+PRESSURE_NORMAL = "normal"
+PRESSURE_WARN = "warn"
+PRESSURE_CRITICAL = "critical"
+PRESSURE_UNKNOWN = "unknown"
+PRESSURE_WORDS = frozenset({PRESSURE_NORMAL, PRESSURE_WARN, PRESSURE_CRITICAL})
 
 
 class CapacityReader:
@@ -48,10 +53,10 @@ class CapacityReader:
         :param reader: zero-arg reader as PressureReader. Example: lambda: "normal"
         :return: pressure as str. Example: "normal"
         """
-        # Call reader. Accept normal, warn, and critical.
-        # If the reader raises, return "unknown" and log a WARNING.
-        # Log the word at INFO.
-        raise NotImplementedError
+        logger.info("Starting read_pressure")
+        word = _pressure_word_from(reader)
+        logger.info("read_pressure word=%s", word)
+        return word
 
     def read(
         self,
@@ -75,6 +80,27 @@ class CapacityReader:
         # When up: GET /api/ps for loaded_model, call recommend(free_gb), models are the three logical names.
         # Log ollama state and recommended size at INFO.
         raise NotImplementedError
+
+
+def _pressure_word_from(reader: PressureReader) -> str:
+    """
+    Call the host probe and keep only normal, warn, or critical.
+
+    :param reader: zero-arg reader as PressureReader. Example: lambda: "normal"
+    :return: accepted word or unknown as str. Example: "unknown"
+    """
+    if not callable(reader):
+        logger.warning("read_pressure reader is not callable")
+        return PRESSURE_UNKNOWN
+    try:
+        raw = reader()
+    except Exception as exc:
+        logger.warning("read_pressure reader failed error_type=%s", type(exc).__name__)
+        return PRESSURE_UNKNOWN
+    if raw in PRESSURE_WORDS:
+        return raw
+    logger.warning("read_pressure unexpected word=%s", raw)
+    return PRESSURE_UNKNOWN
 
 
 def _require_free_gigabytes(free_gb: float) -> float:
