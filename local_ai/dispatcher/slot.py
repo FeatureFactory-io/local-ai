@@ -10,6 +10,10 @@ from local_ai.dispatcher.service import DispatcherService
 
 logger = logging.getLogger(__name__)
 
+_STATUS_COMPLETED = "completed"
+_STATUS_FAILED = "failed"
+_NO_ARTIFACTS: tuple[str, ...] = ()
+
 
 class Slot:
     """
@@ -98,9 +102,73 @@ class Slot:
         :param task_id: claimed pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :return: None. Example: None
         """
-        # WorkerRunner.run_task. It returns "completed" or "failed".
-        # DispatcherService.finish with that status.
-        # Clear the thread marker and call kick so the next queued pin can start.
-        # An exception from the worker still calls finish with status failed and the exception text.
-        # Log dispatcher.finish is inside DispatcherService.finish.
-        raise NotImplementedError
+        logger.info("Starting _run task_id=%s", task_id)
+        try:
+            status, error = self._worker_outcome(task_id)
+            self._finish_pin(task_id, status, error)
+        finally:
+            self._release_slot()
+
+    def _worker_outcome(self, task_id: str) -> tuple[str, str]:
+        """
+        Run the task. An exception becomes status failed and the exception text.
+
+        :param task_id: claimed pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :return: status and error as tuple[str, str]. Example: ("completed", "")
+        """
+        try:
+            status = self._runner.run_task(task_id)
+        except Exception as exc:
+            logger.info("dispatcher.slot | worker_raised | task_id=%s", task_id)
+            return _STATUS_FAILED, _exception_text(exc)
+        logger.info("dispatcher.slot | worker_returned | task_id=%s status=%s", task_id, status)
+        return _status_and_error(status)
+
+    def _finish_pin(self, task_id: str, status: str, error: str) -> None:
+        """
+        Write the terminal pin using the slot clock. Artifacts stay empty until the worker declares them.
+
+        :param task_id: claimed pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param status: completed or failed as str. Example: "completed"
+        :param error: failure summary as str. Example: ""
+        :return: None. Example: None
+        """
+        self._service.finish(task_id, status, error, _NO_ARTIFACTS, self._timestamp(), self._connection)
+
+    def _release_slot(self) -> None:
+        """
+        Drop the thread marker and start the next queued pin when one exists.
+
+        :return: None. Example: None
+        """
+        self._thread = None
+        self.kick()
+
+
+def _status_and_error(status: str) -> tuple[str, str]:
+    """
+    Accept completed or failed. Anything else is stored as failed.
+
+    A failed return stores an empty error. An unexpected status stores a short explanation.
+
+    :param status: worker result as str. Example: "completed"
+    :return: status and error as tuple[str, str]. Example: ("completed", "")
+    """
+    if status == _STATUS_COMPLETED:
+        return _STATUS_COMPLETED, ""
+    if status == _STATUS_FAILED:
+        return _STATUS_FAILED, ""
+    return _STATUS_FAILED, f"unexpected worker status {status!r}"
+
+
+def _exception_text(exc: Exception) -> str:
+    """
+    Use the exception message. A blank message keeps the class name.
+
+    :param exc: worker failure as Exception. Example: ScriptExhausted("script has no turn left")
+    :return: error text as str. Example: "script has no turn left at index=0 model_name=qwen-14b"
+    """
+    text = str(exc).strip()
+    if text:
+        return text
+    return exc.__class__.__name__

@@ -3,6 +3,7 @@
 import logging
 import sqlite3
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pytest
 
 from local_ai.blackboard.pins import Blackboard
 from local_ai.capacity.reader import CapacityReader
-from local_ai.contracts import Completion, SubmitRequest
+from local_ai.contracts import Completion, SubmitRequest, ToolCall
 from local_ai.db.database import Database
 from local_ai.dispatcher.service import DispatcherService
 from local_ai.dispatcher.slot import Slot
@@ -25,6 +26,20 @@ from tests.support.log_story import assert_log_story
 
 _STARTED_AT = "2026-10-04T18:40:02Z"
 _CREATED_AT = "2026-10-04T18:40:00Z"
+_FINISHED_AT = "2026-10-04T18:55:00Z"
+_JOIN_TIMEOUT_S = 5
+_PAUSE_S = "0.6"
+_COMPLETE_TURN = (
+    Completion(content="1. Finish the brief"),
+    Completion(final_answer="The brief is done"),
+)
+_PAUSE_TURN = (
+    Completion(content="1. Pause in the job folder"),
+    Completion(
+        tool_calls=(ToolCall("shell", f"sleep {_PAUSE_S}"),),
+        final_answer="Paused",
+    ),
+)
 
 
 def test_kick_with_an_empty_queue_returns_without_a_thread(tmp_path: Path) -> None:
@@ -42,7 +57,7 @@ def test_kick_after_submit_claims_the_pin_on_a_daemon_thread(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Submit's queued snapshot stays queued. The following read shows running."""
-    service, connection, slot = _open(tmp_path, slot_clock=lambda: _STARTED_AT)
+    service, connection, slot = _open(tmp_path, script=_PAUSE_TURN, slot_clock=lambda: _STARTED_AT)
     caplog.set_level(logging.INFO)
     snapshot = _submit(service, connection, "Write a brief.")
 
@@ -50,17 +65,18 @@ def test_kick_after_submit_claims_the_pin_on_a_daemon_thread(
 
     assert snapshot["status"] == "queued"
     body = service.read_pin(str(snapshot["task_id"]), connection)
+    thread = slot._thread
     assert body["status"] == "running"
-    assert slot._thread is not None
-    assert slot._thread.daemon is True
+    assert thread is not None
+    assert thread.daemon is True
     assert_log_story(
         caplog.records,
         "dispatcher.slot",
         "kick",
         [f"task_id={snapshot['task_id']}"],
     )
-    assert slot._thread.join(timeout=2) is None
-    assert not slot._thread.is_alive()
+    assert thread.join(timeout=_JOIN_TIMEOUT_S) is None
+    assert not thread.is_alive()
 
 
 def test_kick_with_a_live_thread_leaves_both_pins_queued(tmp_path: Path) -> None:
@@ -79,6 +95,47 @@ def test_kick_with_a_live_thread_leaves_both_pins_queued(tmp_path: Path) -> None
     assert service.read_pin(str(second["task_id"]), connection)["status"] == "queued"
     release.set()
     thread.join(timeout=2)
+
+
+def test_run_finishes_a_completed_pin_and_kicks_the_next(tmp_path: Path) -> None:
+    """A completed run_task writes the clock time, then the next pin runs."""
+    service, connection, slot = _open(
+        tmp_path,
+        script=_COMPLETE_TURN + _COMPLETE_TURN,
+        slot_clock=lambda: _FINISHED_AT,
+    )
+    first = _submit(service, connection, "Write the first brief.")
+    second = _submit(service, connection, "Write the second brief.")
+
+    slot.kick()
+    _join_slot(slot)
+
+    first_body = service.read_pin(str(first["task_id"]), connection)
+    second_body = service.read_pin(str(second["task_id"]), connection)
+    assert first_body["status"] == "completed"
+    assert first_body["error"] == ""
+    assert first_body["artifacts"] == []
+    assert second_body["status"] == "completed"
+    assert second_body["error"] == ""
+    assert _finished_at(connection, str(first["task_id"])) == _FINISHED_AT
+    assert _finished_at(connection, str(second["task_id"])) == _FINISHED_AT
+    assert slot._thread is None
+
+
+def test_run_with_a_worker_exception_finishes_failed(tmp_path: Path) -> None:
+    """An exception from the worker still finishes the pin with that text."""
+    service, connection, slot = _open(tmp_path, script=(), slot_clock=lambda: _FINISHED_AT)
+    snapshot = _submit(service, connection, "Write a brief.")
+
+    slot.kick()
+    _join_slot(slot)
+
+    body = service.read_pin(str(snapshot["task_id"]), connection)
+    assert body["status"] == "failed"
+    assert body["error"] == "script has no turn left at index=0 model_name=qwen-14b"
+    assert body["artifacts"] == []
+    assert _finished_at(connection, str(snapshot["task_id"])) == _FINISHED_AT
+    assert slot._thread is None
 
 
 def _open(
@@ -158,6 +215,45 @@ def _ollama_up(url: str) -> tuple[int, dict]:
     if url.endswith("/api/ps"):
         return 200, {"models": [{"name": "qwen2.5:14b"}]}
     raise AssertionError(url)
+
+
+def _join_slot(slot: Slot, timeout: float = _JOIN_TIMEOUT_S) -> None:
+    """
+    Wait until the slot thread and any pin it kicks have stopped.
+
+    :param slot: slot under test as Slot. Example: the slot from _open
+    :param timeout: seconds to wait as float. Example: 5
+    :return: None. Example: None
+    :raises AssertionError: when a worker is still alive at the deadline. Example: a stuck sleep
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        thread = slot._thread
+        if thread is None:
+            return
+        remaining = deadline - time.monotonic()
+        thread.join(timeout=remaining)
+        if thread.is_alive():
+            break
+        if slot._thread is None or slot._thread is thread:
+            return
+    raise AssertionError("slot thread did not finish")
+
+
+def _finished_at(connection: sqlite3.Connection, task_id: str) -> str | None:
+    """
+    Read the pin's finished_at column.
+
+    :param connection: open connection as sqlite3.Connection. Example: the Database connection
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: timestamp or None as str | None. Example: "2026-10-04T18:55:00Z"
+    """
+    row = connection.execute("SELECT finished_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assert row is not None
+    value = row["finished_at"]
+    if value is None:
+        return None
+    return str(value)
 
 
 def _task_count(connection: sqlite3.Connection) -> int:
