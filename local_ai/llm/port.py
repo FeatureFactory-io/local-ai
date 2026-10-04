@@ -140,11 +140,40 @@ def split_note(completion: Completion) -> str:
 
     :param completion: one model turn as Completion. Example: Completion(thinking="The claim is in the last section.")
     :return: note text as str. Example: "The claim is in the last section."
+    :raises TypeError: when completion is not a Completion. Example: None
     """
-    # When thinking is non-empty, return it.
-    # Otherwise return content, which the worker marks as a note.
-    # An empty turn returns an empty string. The caller skips the append.
-    raise NotImplementedError
+    logger.info("Starting split_note")
+    _require_completion(completion)
+    note = _note_text(completion)
+    source = "thinking" if completion.thinking else "content"
+    logger.info("split_note source=%s note_len=%s", source, len(note))
+    return note
+
+
+def _require_completion(completion: Completion) -> None:
+    """
+    Reject a value that is not one model turn.
+
+    :param completion: candidate turn as Completion. Example: Completion(thinking="The claim is in the last section.")
+    :return: None. Example: None
+    :raises TypeError: when completion is not a Completion. Example: None
+    """
+    if not isinstance(completion, Completion):
+        raise TypeError(
+            "completion must be Completion. Example: Completion(thinking='The claim is in the last section.')"
+        )
+
+
+def _note_text(completion: Completion) -> str:
+    """
+    Prefer thinking, then content.
+
+    :param completion: one model turn as Completion. Example: Completion(content="List the chapter files.")
+    :return: note text as str. Example: "List the chapter files."
+    """
+    if completion.thinking:
+        return completion.thinking
+    return completion.content
 
 
 def resolve_model_tag(model_name: str, env: Mapping[str, str]) -> str:

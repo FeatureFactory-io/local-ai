@@ -5,7 +5,7 @@ import logging
 import pytest
 
 from local_ai.contracts import Completion, ScriptExhausted
-from local_ai.llm.port import LiteLLMAdapter, ScriptedLLM
+from local_ai.llm.port import LiteLLMAdapter, ScriptedLLM, split_note
 
 
 def test_scripted_llm_complete_returns_turns_in_order_then_raises() -> None:
@@ -64,3 +64,32 @@ def test_litellm_adapter_complete_still_raises_not_implemented() -> None:
     )
     with pytest.raises(NotImplementedError):
         adapter.complete("Foundation\nTask", "qwen-14b")
+
+
+def test_split_note_returns_thinking_when_present() -> None:
+    """A non-empty thinking stream is the blackboard note."""
+    completion = Completion(
+        thinking="The claim is in the last section.",
+        content="List the chapter files.",
+    )
+    assert split_note(completion) == "The claim is in the last section."
+
+
+def test_split_note_returns_content_when_thinking_is_empty() -> None:
+    """Without thinking, the note is the assistant content."""
+    completion = Completion(thinking="", content="List the chapter files.")
+    assert split_note(completion) == "List the chapter files."
+
+
+def test_split_note_returns_empty_string_when_turn_is_empty() -> None:
+    """An empty turn returns an empty string so the caller can skip the append."""
+    assert split_note(Completion()) == ""
+
+
+def test_split_note_logs_source_and_not_the_note_text(caplog: pytest.LogCaptureFixture) -> None:
+    """INFO names the source. The reasoning text stays off the log."""
+    caplog.set_level(logging.INFO, logger="local_ai.llm.port")
+    split_note(Completion(thinking="SECRET-NOTE-BODY"))
+    messages = "\n".join(record.message for record in caplog.records if record.levelno == logging.INFO)
+    assert "source=thinking" in messages
+    assert "SECRET-NOTE-BODY" not in messages
