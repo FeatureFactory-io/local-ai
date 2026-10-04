@@ -153,7 +153,30 @@ class PlanStore:
 
         :param steps: ordered steps as tuple[PlanStep, ...]. Example: (PlanStep("id", 1, "List chapter files", "completed"),)
         :return: one block as str. Example: "1. List chapter files (completed)."
+        :raises TypeError: when steps is not a tuple of PlanStep. Example: ["List chapter files"]
         """
-        # One line per step: "{order}. {action} ({status})."
-        # Pure. No database call.
-        raise NotImplementedError
+        self._validate_plan_steps(steps)
+        return "\n".join(self._render_step_line(step) for step in steps)
+
+    def _validate_plan_steps(self, steps: tuple[PlanStep, ...]) -> None:
+        """
+        Reject anything other than a tuple of PlanStep.
+
+        :param steps: ordered steps as tuple[PlanStep, ...]. Example: ()
+        :return: None. Example: None
+        :raises TypeError: when steps is not a tuple of PlanStep. Example: ["List chapter files"]
+        """
+        if not isinstance(steps, tuple):
+            raise TypeError(f"steps must be a tuple, got {type(steps).__name__}")
+        for step in steps:
+            if not isinstance(step, PlanStep):
+                raise TypeError(f"steps must contain PlanStep, got {type(step).__name__}")
+
+    def _render_step_line(self, step: PlanStep) -> str:
+        """
+        Format one step as a single line.
+
+        :param step: one step as PlanStep. Example: PlanStep("id", 1, "List chapter files", "completed")
+        :return: one line as str. Example: "1. List chapter files (completed)."
+        """
+        return f"{step.order}. {step.action} ({step.status})."
