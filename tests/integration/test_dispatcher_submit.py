@@ -272,6 +272,92 @@ def test_submit_with_priority_outside_range_does_not_insert(tmp_path: Path) -> N
     assert not (tmp_path / "jobs").exists()
 
 
+def test_claim_next_with_an_empty_queue_returns_none(tmp_path: Path) -> None:
+    """No queued pin means there is nothing to claim."""
+    service, connection = _dispatcher(tmp_path)
+
+    assert service.claim_next(connection, "2026-10-04T18:40:02Z") is None
+
+
+def test_claim_next_claims_the_head_and_a_second_call_returns_none(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The first call marks the only pin running. The second call returns None."""
+    service, connection = _dispatcher(tmp_path, clock=lambda: "2026-10-04T18:40:00Z")
+    queued = service.submit(
+        SubmitRequest("Write a brief.", "brief.md exists", priority=40, model="qwen-14b"),
+        connection,
+    )
+    caplog.set_level(logging.INFO)
+
+    claimed = service.claim_next(connection, "2026-10-04T18:40:02Z")
+    again = service.claim_next(connection, "2026-10-04T18:41:00Z")
+
+    assert claimed is not None
+    assert claimed.task_id == queued["task_id"]
+    assert claimed.status == "running"
+    assert claimed.phase == "queued"
+    assert claimed.started_at == "2026-10-04T18:40:02Z"
+    assert again is None
+    row = connection.execute(
+        "SELECT status, phase, started_at FROM tasks WHERE id = ?",
+        (queued["task_id"],),
+    ).fetchone()
+    assert row["status"] == "running"
+    assert row["phase"] == "queued"
+    assert row["started_at"] == "2026-10-04T18:40:02Z"
+    assert_log_story(
+        caplog.records,
+        "dispatcher.claim_next",
+        "claimed",
+        [f"task_id={queued['task_id']}"],
+    )
+
+
+def test_claim_next_takes_the_lowest_priority_number_first(tmp_path: Path) -> None:
+    """Priority 10 is the head even when it was inserted after priority 80."""
+    stamps = iter(["2026-10-04T18:40:00Z", "2026-10-04T18:40:01Z"])
+    service, connection = _dispatcher(tmp_path, clock=lambda: next(stamps))
+    later = service.submit(
+        SubmitRequest("Later.", "later.md exists", priority=80, model="qwen-14b"),
+        connection,
+    )
+    sooner = service.submit(
+        SubmitRequest("Sooner.", "sooner.md exists", priority=10, model="qwen-8b"),
+        connection,
+    )
+
+    claimed = service.claim_next(connection, "2026-10-04T18:40:02Z")
+
+    assert claimed is not None
+    assert claimed.task_id == sooner["task_id"]
+    waiting = connection.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (later["task_id"],),
+    ).fetchone()
+    assert waiting["status"] == "queued"
+
+
+def test_claim_next_with_a_blank_started_at_leaves_the_pin_queued(tmp_path: Path) -> None:
+    """A blank dispatch time raises and does not move the pin to running."""
+    service, connection = _dispatcher(tmp_path)
+    queued = service.submit(
+        SubmitRequest("Write a brief.", "brief.md exists", priority=40, model="qwen-14b"),
+        connection,
+    )
+
+    with pytest.raises(ValueError, match="started_at"):
+        service.claim_next(connection, " ")
+
+    row = connection.execute(
+        "SELECT status, started_at FROM tasks WHERE id = ?",
+        (queued["task_id"],),
+    ).fetchone()
+    assert row["status"] == "queued"
+    assert row["started_at"] is None
+
+
 def test_submit_with_unknown_model_does_not_insert(tmp_path: Path) -> None:
     """An unknown model raises and leaves the queue empty."""
     service, connection = _dispatcher(tmp_path)

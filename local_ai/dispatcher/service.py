@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 _GRANT_MODES = ("job", "paths", "home")
 _JOB_MODE = "job"
 _STATUS_QUEUED = "queued"
+_STATUS_RUNNING = "running"
 _PHASE_QUEUED = "queued"
 _REASON_OLLAMA_DOWN = "ollama_down"
 _REASON_MODEL_UNAVAILABLE = "model_unavailable"
@@ -195,11 +197,19 @@ class DispatcherService:
         :param connection: open connection as sqlite3.Connection. Example: the Database connection
         :param started_at: dispatch time as str. Example: "2026-10-04T18:40:02Z"
         :return: claimed pin or None as TaskPin | None. Example: None
+        :raises ValueError: when started_at is blank. Example: " "
+        :raises TypeError: when connection is not a Connection. Example: None
         """
-        # Blackboard.list_queued. The first row is the head.
-        # Blackboard.claim. If it returns False, another caller took it: return None.
-        # Log the task_id at INFO when a pin is claimed.
-        raise NotImplementedError
+        logger.info("Starting claim_next")
+        head = _head_pin(self._blackboard.list_queued(connection))
+        if head is None:
+            logger.info("dispatcher.claim_next | empty")
+            return None
+        if not self._blackboard.claim(connection, head.task_id, started_at):
+            logger.info("dispatcher.claim_next | lost | task_id=%s", head.task_id)
+            return None
+        logger.info("dispatcher.claim_next | claimed | task_id=%s", head.task_id)
+        return replace(head, status=_STATUS_RUNNING, started_at=started_at)
 
     def recover_running(self, connection: sqlite3.Connection) -> tuple[str, ...]:
         """
@@ -330,6 +340,18 @@ def _utc_timestamp() -> str:
     :return: timestamp as str. Example: "2026-10-04T18:40:00.000000Z"
     """
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _head_pin(queued: tuple[TaskPin, ...]) -> TaskPin | None:
+    """
+    Return the first queued pin. list_queued already applied queue order.
+
+    :param queued: queued pins as tuple[TaskPin, ...]. Example: ()
+    :return: head pin or None as TaskPin | None. Example: None
+    """
+    if len(queued) == 0:
+        return None
+    return queued[0]
 
 
 def _require_submit_request(request: SubmitRequest) -> None:
