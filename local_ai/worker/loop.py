@@ -172,13 +172,15 @@ class Worker:
         :param model_name: logical size as str. Example: "qwen-24b"
         :param error: tool error as str. Example: "weasyprint: CSS path missing"
         :return: None. Example: None
+        :raises ValueError: when task_id, order, or model_name is unusable, or the action is empty. Example: ""
+        :raises TypeError: when error is not a str. Example: None
         """
-        # Set phase recovering.
-        # Ask LlmPort for a replacement action. PlanStore.insert_after.
-        # The failed row stays failed.
-        # Refresh current_plan on the blackboard.
-        # Log task_id and the new order at INFO.
-        raise NotImplementedError
+        logger.info("Starting adapt_after_failure task_id=%s step=%s", task_id, order)
+        _require_adapt_args(task_id, order, model_name, error)
+        self._publish_phase(task_id, "recovering")
+        new_order = self._insert_replacement(task_id, order, model_name, error)
+        self._publish_phase(task_id, "acting")
+        logger.info("worker.adapt | inserted | task_id=%s step=%s", task_id, new_order)
 
     def note_identical_failure(self, task_id: str, order: int, command: str) -> bool:
         """
@@ -388,6 +390,45 @@ class Worker:
         logger.info("worker.step | failed | task_id=%s step=%s", task_id, order)
         return "failed"
 
+    def _insert_replacement(self, task_id: str, order: int, model_name: str, error: str) -> int:
+        """
+        Ask for one replacement sentence and insert it after the failed step.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: failed step order as int. Example: 2
+        :param model_name: logical size as str. Example: "qwen-24b"
+        :param error: tool error as str. Example: "weasyprint: CSS path missing"
+        :return: new order as int. Example: 3
+        :raises ValueError: when the model names no action. Example: Completion()
+        """
+        completion = self._llm.complete(self._recovery_prompt(task_id, order, error), model_name)
+        action = _action_sentence(completion)
+        if not action:
+            raise ValueError("replacement action is empty. Example: 'Fix the CSS path'")
+        return self._plan.insert_after(self._connection, task_id, order, action)
+
+    def _recovery_prompt(self, task_id: str, order: int, error: str) -> str:
+        """
+        Ask for one replacement action. The error is in the prompt, not the log.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: failed step order as int. Example: 2
+        :param error: tool error as str. Example: "weasyprint: CSS path missing"
+        :return: prompt as str. Example: "Foundation\\n\\nThe command failed."
+        """
+        logger.info(
+            "worker.adapt | recovering | task_id=%s step=%s error_len=%s",
+            task_id,
+            order,
+            len(error),
+        )
+        return (
+            self._step_prompt(task_id, order)
+            + "\n\nThe command failed.\n"
+            + error
+            + "\nReply with one replacement action."
+        )
+
     def _next_failure_count(self, task_id: str, command: str) -> int:
         """
         Increment the count when the command matches. A new command starts at one.
@@ -404,6 +445,38 @@ class Worker:
 
 _ROUNDS = MAX_ROUNDS_PER_STEP
 _IDENTICAL = MAX_IDENTICAL_FAILURES
+
+
+def _require_adapt_args(task_id: str, order: int, model_name: str, error: str) -> None:
+    """
+    Reject an adapt call the plan store cannot apply.
+
+    :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :param order: failed step order as int. Example: 2
+    :param model_name: logical size as str. Example: "qwen-24b"
+    :param error: tool error as str. Example: "weasyprint: CSS path missing"
+    :return: None. Example: None
+    :raises ValueError: when task_id, order, or model_name is unusable. Example: ""
+    :raises TypeError: when error is not a str. Example: None
+    """
+    _require_step_args(task_id, order, model_name)
+    if not isinstance(error, str):
+        raise TypeError("error must be str. Example: 'weasyprint: CSS path missing'")
+
+
+def _action_sentence(completion: Completion) -> str:
+    """
+    Take the first sentence from the final answer, or from content.
+
+    :param completion: recovery turn as Completion. Example: Completion(final_answer="Fix the CSS path")
+    :return: action as str. Example: "Fix the CSS path"
+    """
+    text = completion.final_answer.strip() or completion.content.strip()
+    line = next((item.strip() for item in text.splitlines() if item.strip()), "")
+    match = _NUMBERED_STEP.match(line)
+    if match is None:
+        return line
+    return match.group(2)
 
 
 def _require_failure_args(task_id: str, order: int, command: str) -> None:

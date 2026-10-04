@@ -239,6 +239,39 @@ def test_note_identical_failure_different_command_resets_count(tmp_path: Path) -
     assert worker.note_identical_failure(_TASK_ID, 2, "printf b") is True
 
 
+def test_adapt_after_failure_inserts_replacement_and_keeps_failed_row(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A replacement step is inserted. The failed row stays failed."""
+    worker, connection, _job_dir = _open_worker(
+        tmp_path,
+        (Completion(final_answer="Write the marker with python3"),),
+    )
+    _insert_pending(
+        worker,
+        connection,
+        (StepDraft(1, "Run the check"), StepDraft(2, "Record the result")),
+    )
+    worker._plan.mark_running(connection, _TASK_ID, 1)
+    worker._plan.fail_step(connection, _TASK_ID, 1, "boom")
+    caplog.set_level(logging.INFO)
+
+    worker.adapt_after_failure(_TASK_ID, 1, "qwen-14b", "boom")
+
+    steps = _steps(worker, connection)
+    assert [(step.order, step.action, step.status) for step in steps] == [
+        (1, "Run the check", "failed"),
+        (2, "Write the marker with python3", "pending"),
+        (3, "Record the result", "pending"),
+    ]
+    pin = worker._blackboard.get_pin(connection, _TASK_ID)
+    assert pin is not None
+    assert "Write the marker with python3 (pending)." in pin.current_plan
+    assert_log_story(caplog.records, "blackboard.set_phase", "phase=recovering", [f"task_id={_TASK_ID}"])
+    assert_log_story(caplog.records, "worker.adapt", "inserted", [f"task_id={_TASK_ID}", "step=2"])
+
+
 def _open_worker(
     tmp_path: Path,
     script: tuple[Completion, ...],
