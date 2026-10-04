@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 _STATUS_COMPLETED = "completed"
 _STATUS_FAILED = "failed"
+_FAILED_RETURN = "run_task returned failed"
 _NO_ARTIFACTS: tuple[str, ...] = ()
 
 
@@ -149,15 +150,15 @@ def _status_and_error(status: str) -> tuple[str, str]:
     """
     Accept completed or failed. Anything else is stored as failed.
 
-    A failed return stores an empty error. An unexpected status stores a short explanation.
+    A failed return stores a short error. An unexpected status stores its own explanation.
 
-    :param status: worker result as str. Example: "completed"
-    :return: status and error as tuple[str, str]. Example: ("completed", "")
+    :param status: worker result as str. Example: "failed"
+    :return: status and error as tuple[str, str]. Example: ("failed", "run_task returned failed")
     """
     if status == _STATUS_COMPLETED:
         return _STATUS_COMPLETED, ""
     if status == _STATUS_FAILED:
-        return _STATUS_FAILED, ""
+        return _STATUS_FAILED, _FAILED_RETURN
     return _STATUS_FAILED, f"unexpected worker status {status!r}"
 
 

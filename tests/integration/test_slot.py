@@ -161,6 +161,35 @@ def test_run_with_a_worker_exception_finishes_failed(tmp_path: Path) -> None:
     assert slot._thread is None
 
 
+def test_failed_run_task_finishes_the_pin_with_an_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed run_task still finishes the pin and logs dispatcher.finish."""
+    service, connection, slot = _open(
+        tmp_path,
+        script=(Completion(content="I cannot plan"),),
+        slot_clock=lambda: _FINISHED_AT,
+    )
+    caplog.set_level(logging.INFO)
+    snapshot = _submit(service, connection, "Write a brief.")
+
+    slot.kick()
+    _join_slot(slot)
+
+    task_id = str(snapshot["task_id"])
+    body = service.read_pin(task_id, connection)
+    assert body["status"] == "failed"
+    assert isinstance(body["error"], str) and body["error"].strip() != ""
+    assert _finished_at(connection, task_id) == _FINISHED_AT
+    assert_log_story(
+        caplog.records,
+        "dispatcher.finish",
+        "exit",
+        [f"task_id={task_id}", "status=failed"],
+    )
+
+
 def _open(
     tmp_path: Path,
     script: tuple[Completion, ...] = (),
