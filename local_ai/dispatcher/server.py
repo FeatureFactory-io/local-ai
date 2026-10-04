@@ -153,9 +153,14 @@ class LocalAiServer:
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param priority: new priority as int. Example: 5
         :return: queued or rejected body as dict. Example: {"status": "rejected", "reason": "not_queued"}
+        :raises ValueError: when task_id is blank. Example: "  "
+        :raises InvalidPriority: when priority is outside 1..100. Example: 0
         """
-        # DispatcherService.reprioritize. Do not call the slot.
-        raise NotImplementedError
+        logger.info("reprioritize | entry")
+        _require_text(task_id, "task_id", "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f")
+        body = self._service.reprioritize(task_id, priority, self._connection)
+        logger.info("reprioritize | exit | status=%s", body.get("status"))
+        return body
 
 
 def main() -> None:

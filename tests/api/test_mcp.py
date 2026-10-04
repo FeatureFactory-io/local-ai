@@ -166,6 +166,63 @@ def test_read_missing_pin_returns_not_found(tmp_path: Path) -> None:
     assert body["task_id"] == "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
 
 
+def test_reprioritize_queued_pin_returns_the_new_position_without_kicking(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A queued pin changes priority. The slot is not called, so it stays queued."""
+    server = _server(tmp_path, script=_HOLD_SCRIPT)
+    caplog.set_level(logging.INFO)
+    try:
+        first = server.submit("Write the first brief.", "brief.md exists", priority=40, model="qwen-14b")
+        second = server.submit("Write the second brief.", "brief.md exists", priority=80, model="qwen-14b")
+        kicks_before = _kick_count(caplog)
+        body = server.reprioritize(str(second["task_id"]), 5)
+        queued = server.read(str(second["task_id"]))
+        running = server.read(str(first["task_id"]))
+        kicks_after = _kick_count(caplog)
+    finally:
+        _join_slot(server)
+
+    assert second["status"] == "queued"
+    assert set(body) == set(_contract("reprioritize_queued.json"))
+    assert body["status"] == "queued"
+    assert body["priority"] == 5
+    assert body["task_id"] == second["task_id"]
+    assert body["position"] == 1
+    assert kicks_after == kicks_before
+    assert queued["status"] == "queued"
+    assert queued["priority"] == 5
+    assert running["status"] == "running"
+
+
+def test_reprioritize_running_pin_returns_not_queued(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A running pin is rejected and its priority stays put. The slot is not called."""
+    server = _server(tmp_path, script=_HOLD_SCRIPT)
+    caplog.set_level(logging.INFO)
+    try:
+        first = server.submit("Write a brief.", "brief.md exists", priority=40, model="qwen-14b")
+        kicks_before = _kick_count(caplog)
+        body = server.reprioritize(str(first["task_id"]), 5)
+        live = server.read(str(first["task_id"]))
+        kicks_after = _kick_count(caplog)
+    finally:
+        _join_slot(server)
+
+    assert set(body) == set(_contract("reprioritize_rejected.json"))
+    assert body == {
+        "status": "rejected",
+        "reason": "not_queued",
+        "task_id": first["task_id"],
+    }
+    assert kicks_after == kicks_before
+    assert live["status"] == "running"
+    assert live["priority"] == 40
+
+
 class _CountingReader(CapacityReader):
     """Real CapacityReader that counts read calls."""
 
@@ -267,6 +324,16 @@ def _scripted_ollama(tags_status: int, loaded_model: str | None) -> tuple[Http, 
         raise AssertionError(url)
 
     return ollama, calls
+
+
+def _kick_count(caplog: pytest.LogCaptureFixture) -> int:
+    """
+    Count Slot.kick entry lines.
+
+    :param caplog: captured logs as pytest.LogCaptureFixture. Example: the test's caplog
+    :return: entry count as int. Example: 1
+    """
+    return sum(1 for record in caplog.records if record.message == "Starting kick")
 
 
 def _join_slot(server: LocalAiServer, timeout: float = _JOIN_TIMEOUT_S) -> None:
