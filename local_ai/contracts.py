@@ -1,7 +1,11 @@
 """Shared types and validators. Collaborators import these and do not redefine them."""
 
+import logging
 from dataclasses import dataclass
 from typing import Protocol
+
+
+logger = logging.getLogger(__name__)
 
 
 PRIORITY_MIN = 1
@@ -235,10 +239,30 @@ def validate_priority(value: int | None) -> int:
     :return: priority as int. Example: 40
     :raises InvalidPriority: when value is outside 1..100. Example: 0
     """
-    # None becomes PRIORITY_DEFAULT (50).
-    # Reject values below PRIORITY_MIN or above PRIORITY_MAX with InvalidPriority.
-    # Log the accepted priority at INFO.
-    raise NotImplementedError
+    logger.info("Starting validate_priority value=%s", value)
+    if value is None:
+        logger.info("Priority omitted; using default=%s", PRIORITY_DEFAULT)
+        return PRIORITY_DEFAULT
+    _reject_priority_unless_in_range(value)
+    logger.info("Accepted priority value=%s", value)
+    return value
+
+
+def _reject_priority_unless_in_range(value: object) -> None:
+    """
+    Raise when priority is not an int inside 1..100.
+
+    :param value: candidate priority as object. Example: 0
+    :return: None. Example: None
+    :raises InvalidPriority: when value is outside 1..100. Example: 101
+    """
+    # bool is an int subclass; accepting it would turn True into priority 1.
+    if type(value) is not int:
+        logger.info("Rejecting priority branch=type value_type=%s", type(value).__name__)
+        raise InvalidPriority(f"priority must be an int, got {type(value).__name__}")
+    if value < PRIORITY_MIN or value > PRIORITY_MAX:
+        logger.info("Rejecting priority branch=range value=%s", value)
+        raise InvalidPriority(f"priority {value} is outside {PRIORITY_MIN}..{PRIORITY_MAX}")
 
 
 def validate_model(name: str) -> str:
