@@ -236,6 +236,61 @@ def test_complete_step_rejects_a_step_that_is_not_running(tmp_path: Path, status
     assert row["result_json"] == ""
 
 
+def test_fail_step_marks_a_running_step_failed(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A running step becomes failed and stores the error. The log omits that text."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(2, "Write a thesis per chapter"),))
+    store.mark_running(connection, _TASK_ID, 2)
+    error = "weasyprint: CSS path missing"
+
+    with caplog.at_level(logging.INFO, logger="local_ai.plan.steps"):
+        store.fail_step(connection, _TASK_ID, 2, error)
+
+    row = _step_rows(connection, _TASK_ID)[0]
+    assert row["status"] == "failed"
+    assert row["error"] == error
+    assert row["action"] == "Write a thesis per chapter"
+    assert _TASK_ID in caplog.text
+    assert "order=2" in caplog.text
+    assert "status=failed" in caplog.text
+    assert error not in caplog.text
+
+
+def test_fail_step_leaves_a_completed_step_completed(tmp_path: Path) -> None:
+    """fail_step does not rewrite a completed row."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(1, "List chapter files"),))
+    store.mark_running(connection, _TASK_ID, 1)
+    store.complete_step(connection, _TASK_ID, 1, "Found ch-01.md through ch-12.md", '{"success": true}')
+    connection.execute(
+        "UPDATE plan_steps SET error = ? WHERE task_id = ? AND step_order = ?",
+        ("already recorded", _TASK_ID, 1),
+    )
+
+    store.fail_step(connection, _TASK_ID, 1, "weasyprint: CSS path missing")
+
+    row = _step_rows(connection, _TASK_ID)[0]
+    assert row["status"] == "completed"
+    assert row["error"] == "already recorded"
+    assert row["llm_synthesis"] == "Found ch-01.md through ch-12.md"
+    assert row["result_json"] == '{"success": true}'
+
+
+@pytest.mark.parametrize("status", ["pending", "waiting_retry", "failed"])
+def test_fail_step_rejects_a_step_that_is_not_running_or_completed(tmp_path: Path, status: str) -> None:
+    """pending, waiting_retry, and an already failed step raise InvalidStepTransition."""
+    store, connection = _open_store(tmp_path)
+    store.insert_steps(connection, _TASK_ID, (StepDraft(3, "Assemble summary.md"),))
+    _set_status(connection, _TASK_ID, 3, status)
+
+    with pytest.raises(InvalidStepTransition):
+        store.fail_step(connection, _TASK_ID, 3, "weasyprint: CSS path missing")
+
+    row = _step_rows(connection, _TASK_ID)[0]
+    assert row["status"] == status
+    assert row["error"] == ""
+
+
 def test_complete_step_rejects_a_missing_step(tmp_path: Path) -> None:
     """A missing order is not running, so it cannot be completed."""
     store, connection = _open_store(tmp_path)

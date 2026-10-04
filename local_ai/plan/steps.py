@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 _STATUS_PENDING = "pending"
 _STATUS_RUNNING = "running"
 _STATUS_COMPLETED = "completed"
+_STATUS_FAILED = "failed"
 _STATUS_WAITING_RETRY = "waiting_retry"
 _MARK_RUNNING_SOURCES = frozenset({_STATUS_PENDING, _STATUS_WAITING_RETRY})
 _MIN_STEP_ORDER = 1
@@ -129,12 +130,15 @@ class PlanStore:
         :param order: step order as int. Example: 2
         :param error: step error as str. Example: "weasyprint: CSS path missing"
         :return: None. Example: None
-        :raises InvalidStepTransition: when the step is pending. Example: order 3 still pending
+        :raises InvalidStepTransition: when the step is pending, waiting_retry, failed, or missing. Example: order 3 still pending
+        :raises TypeError: when error is not a str. Example: None
         """
-        # If the row is already completed, return without writing.
-        # If the row is running, set status failed and store error.
-        # Log task_id, order, and that the step failed at INFO. Do not log the full stderr.
-        raise NotImplementedError
+        self._require_step_address(connection, task_id, order)
+        self._require_text("error", error)
+        if self._completed_step_stays(connection, task_id, order):
+            return
+        self._store_failure(connection, task_id, order, error)
+        logger.info("PlanStore.fail_step task_id=%s order=%s status=failed", task_id, order)
 
     def insert_after(
         self,
@@ -315,6 +319,41 @@ class PlanStore:
         ).fetchone()
         if row is not None:
             raise ValueError(f"step order {int(row['step_order'])} already exists for task_id={task_id}")
+
+    def _completed_step_stays(self, connection: sqlite3.Connection, task_id: str, order: int) -> bool:
+        """
+        Leave a completed step completed. Allow only running to fail.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :return: True when the row stays completed as bool. Example: True
+        :raises InvalidStepTransition: when the step is pending, waiting_retry, failed, or missing. Example: order 3 still pending
+        """
+        status = self._require_step_status(connection, task_id, order)
+        if status == _STATUS_COMPLETED:
+            logger.info("PlanStore.fail_step task_id=%s order=%s stayed=completed", task_id, order)
+            return True
+        if status != _STATUS_RUNNING:
+            raise InvalidStepTransition(
+                f"cannot fail_step from status={status} task_id={task_id} order={order}"
+            )
+        return False
+
+    def _store_failure(self, connection: sqlite3.Connection, task_id: str, order: int, error: str) -> None:
+        """
+        Mark one running step failed and store the error.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: parent pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step order as int. Example: 2
+        :param error: step error as str. Example: "weasyprint: CSS path missing"
+        :return: None. Example: None
+        """
+        connection.execute(
+            "UPDATE plan_steps SET status = ?, error = ? WHERE task_id = ? AND step_order = ?",
+            (_STATUS_FAILED, error, task_id, order),
+        )
 
     def _require_text(self, name: str, value: str) -> None:
         """
