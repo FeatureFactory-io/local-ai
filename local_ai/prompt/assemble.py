@@ -1,6 +1,17 @@
 """Three prompt layers. Worker calls PromptAssembler before every model turn."""
 
+import logging
+
 from local_ai.contracts import AccessGrant
+
+logger = logging.getLogger(__name__)
+
+_FOUNDATION_TEXT = (
+    "You are the local worker for one task. "
+    "Plan, then act one step at a time. "
+    "After a failed command, revise the remaining plan. "
+    "Emit a short reasoning note before each command."
+)
 
 
 class PromptAssembler:
@@ -37,10 +48,8 @@ class PromptAssembler:
 
         :return: foundation text as str. Example: "You are the local worker for one task."
         """
-        # State: plan, then act one step at a time.
-        # After a failed command, revise the remaining plan.
-        # Emit a short reasoning note before each command.
-        raise NotImplementedError
+        logger.info("PromptAssembler._foundation")
+        return _FOUNDATION_TEXT
 
     def _shell_brief(self) -> str:
         """
