@@ -313,6 +313,91 @@ def test_stdio_client_stops_after_three_failed_steps(tmp_path: Path) -> None:
     _assert_stdout_is_only_jsonrpc(stdout)
 
 
+def test_stdio_client_rejects_an_empty_plan(tmp_path: Path) -> None:
+    """An empty plan is rejected and does not start a worker turn."""
+    host, port, server = _start_ollama([])
+    process = _start_dispatcher(tmp_path, host, port)
+    stdout: list[str] = []
+    try:
+        _send(process, _initialize())
+        _response(process, 1, stdout)
+        _send(process, _initialized())
+        _send(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "submit",
+                    "arguments": {
+                        "goal": "Summarize the notes.",
+                        "done_when": "summary.md exists",
+                        "model": "qwen-14b",
+                        "plan": [],
+                    },
+                },
+            },
+        )
+        message = _response(process, 2, stdout)
+    finally:
+        _stop(process)
+        server.shutdown()
+
+    assert "at least one step" in str(message.get("error") or message.get("result"))
+    assert _OllamaHandler.chat_posts == 0
+    _assert_stdout_is_only_jsonrpc(stdout)
+
+
+def test_stdio_client_uses_a_submitted_plan(tmp_path: Path) -> None:
+    """A submitted plan is stored before any model call, and acting writes the files."""
+    extract = "Extract the notes into book.txt"
+    thesis = "Write one thesis line into summary.md"
+    write_book = "python3 -c " + shlex.quote("open('book.txt','w').write('notes\\n')")
+    write_summary = "python3 -c " + shlex.quote("open('summary.md','w').write('The thesis is the canvas.\\n')")
+    host, port, server = _start_ollama(
+        [
+            _chat("Wrote book.txt", thinking="Extracting.", command=write_book),
+            _chat("Wrote summary.md", thinking="One thesis line.", command=write_summary),
+        ]
+    )
+    process = _start_dispatcher(tmp_path, host, port)
+    stdout: list[str] = []
+    try:
+        _send(process, _initialize())
+        _response(process, 1, stdout)
+        _send(process, _initialized())
+        accepted = _tool(
+            process,
+            2,
+            "submit",
+            {
+                "goal": "Summarize the notes.",
+                "done_when": "summary.md exists",
+                "priority": 40,
+                "model": "qwen-14b",
+                "access": {"mode": "job"},
+                "plan": [extract, thesis],
+            },
+            stdout,
+        )
+        queued = _tool(process, 3, "read", {"task_id": str(accepted["task_id"])}, stdout)
+        pin = _poll_until_terminal(process, str(accepted["task_id"]), stdout)
+    finally:
+        _stop(process)
+        server.shutdown()
+
+    job = tmp_path / "jobs" / str(accepted["task_id"])
+    assert accepted["status"] == "queued"
+    assert [step["action"] for step in queued["steps"]] == [extract, thesis]
+    assert pin["status"] == "completed", pin.get("error")
+    assert [step["action"] for step in pin["steps"]] == [extract, thesis]
+    assert (job / "book.txt").read_text(encoding="utf-8") == "notes\n"
+    assert (job / "summary.md").read_text(encoding="utf-8") == "The thesis is the canvas.\n"
+    assert _OllamaHandler.chat_posts == 2
+    _assert_stdout_is_only_jsonrpc(stdout)
+
+
 def _three_failures() -> list[dict]:
     """Plan with one failing command, then two different failing replacements."""
     return [

@@ -38,6 +38,7 @@ Call them in this order.
 | `model` | no | `qwen-8b`, `qwen-14b`, or `qwen-24b`. Default is `recommended` from `capacity` |
 | `inputs` | no | File paths copied into the job folder when `access.mode` is `job` |
 | `access` | no | `{ "mode": "job" }` (default), `{ "mode": "paths", "paths": ["/absolute/dir"] }`, or `{ "mode": "home" }` |
+| `plan` | no | Ordered step sentences. When present, the worker skips planning and acts on these steps |
 
 A rejected call is still a normal MCP result. Check `status`. `rejected` with `reason: ollama_down` means Ollama was not up. `reason: model_unavailable` means `capacity` recommended `none` and `submit` did not name a model.
 

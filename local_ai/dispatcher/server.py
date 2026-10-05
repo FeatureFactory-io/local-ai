@@ -139,6 +139,7 @@ class LocalAiServer:
         model: str | None = None,
         inputs: list[str] | None = None,
         access: dict | None = None,
+        plan: list[str] | None = None,
     ) -> dict:
         """
         Pin a task and enqueue it.
@@ -149,12 +150,13 @@ class LocalAiServer:
         :param model: qwen size or omitted as str | None. Example: "qwen-14b"
         :param inputs: files to copy as list[str] | None. Example: []
         :param access: grant object or omitted as dict | None. Example: {"mode": "job"}
+        :param plan: ordered step sentences, or omitted to let the worker plan. Example: ["Write marker.txt"]
         :return: queued or rejected body as dict. Example: {"status": "queued", "position": 1}
-        :raises ValueError: when goal or done_when is blank. Example: ""
-        :raises TypeError: when inputs is not a list of strings. Example: "notes.md"
+        :raises ValueError: when goal, done_when, or a plan step is blank. Example: ""
+        :raises TypeError: when inputs or plan is not a list of strings. Example: "notes.md"
         """
         logger.info("submit | entry")
-        request = _submit_request(goal, done_when, priority, model, inputs, access)
+        request = _submit_request(goal, done_when, priority, model, inputs, access, plan)
         snapshot = self._service.submit(request, self._connection)
         if snapshot.get("status") == _STATUS_QUEUED:
             self._slot.kick()
@@ -362,6 +364,7 @@ def _submit_request(
     model: str | None,
     inputs: list[str] | None,
     access: dict | None,
+    plan: list[str] | None,
 ) -> SubmitRequest:
     """
     Build the request the dispatcher accepts.
@@ -372,13 +375,45 @@ def _submit_request(
     :param model: qwen size or omitted as str | None. Example: "qwen-14b"
     :param inputs: files to copy as list[str] | None. Example: []
     :param access: grant object or omitted as dict | None. Example: {"mode": "job"}
+    :param plan: ordered step sentences or omitted as list[str] | None. Example: ["Write marker.txt"]
     :return: request as SubmitRequest. Example: SubmitRequest("Write a brief.", "brief.md exists")
-    :raises ValueError: when goal or done_when is blank. Example: ""
-    :raises TypeError: when inputs is not a list of strings. Example: "notes.md"
+    :raises ValueError: when goal, done_when, or a plan step is blank. Example: ""
+    :raises TypeError: when inputs or plan is not a list of strings. Example: "notes.md"
     """
     _require_text(goal, "goal", "Summarize the book into 2-3 pages.")
     _require_text(done_when, "done_when", "summary.md exists")
-    return SubmitRequest(goal, done_when, priority, model, _input_paths(inputs), access)
+    return SubmitRequest(
+        goal,
+        done_when,
+        priority,
+        model,
+        _input_paths(inputs),
+        access,
+        _plan_steps(plan),
+    )
+
+
+def _plan_steps(plan: list[str] | None) -> tuple[str, ...] | None:
+    """
+    Accept omitted plan, or a list of non-blank step sentences.
+
+    :param plan: ordered steps or omitted as list[str] | None. Example: ["Write marker.txt"]
+    :return: steps or None as tuple[str, ...] | None. Example: ("Write marker.txt",)
+    :raises TypeError: when plan is not a list of strings. Example: "Write marker.txt"
+    :raises ValueError: when plan is empty or a step is blank. Example: []
+    """
+    if plan is None:
+        return None
+    if not isinstance(plan, list):
+        raise TypeError("plan must be a list of strings. Example: ['Write marker.txt']")
+    if not plan:
+        raise ValueError("plan must contain at least one step. Example: ['Write marker.txt']")
+    actions: list[str] = []
+    for action in plan:
+        if not isinstance(action, str) or not action.strip():
+            raise ValueError("plan step must be a non-empty string. Example: 'Write marker.txt'")
+        actions.append(action.strip())
+    return tuple(actions)
 
 
 def _require_text(value: object, name: str, example: str) -> None:

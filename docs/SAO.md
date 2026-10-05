@@ -522,11 +522,12 @@ Request:
   "priority": 40,
   "model": "qwen-14b",
   "inputs": ["/Users/denispetelin/books/draft"],
-  "access": { "mode": "paths", "paths": ["/Users/denispetelin/books/draft"] }
+  "access": { "mode": "paths", "paths": ["/Users/denispetelin/books/draft"] },
+  "plan": ["List the chapter files", "Write one thesis line per chapter into summary.md"]
 }
 ```
 
-`priority` is an integer from 1 to 100. Omitted priority defaults to 50. Omitted access defaults to `{ "mode": "job" }`. Omitted model defaults to the `recommended` value from the latest `capacity` reading. If that value is `none`, `submit` is rejected.
+`priority` is an integer from 1 to 100. Omitted priority defaults to 50. Omitted access defaults to `{ "mode": "job" }`. Omitted model defaults to the `recommended` value from the latest `capacity` reading. If that value is `none`, `submit` is rejected. Omitted `plan` lets the worker write the numbered steps. A present `plan` is those sentences in order; the worker stores them and skips the planning call. An empty list or a blank sentence is rejected.
 
 Response:
 

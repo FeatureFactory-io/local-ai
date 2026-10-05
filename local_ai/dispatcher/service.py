@@ -24,6 +24,7 @@ from local_ai.contracts import (
     JobSummary,
     PlanStep,
     ReasoningNote,
+    StepDraft,
     SubmitRequest,
     TaskPin,
     default_grant,
@@ -150,6 +151,8 @@ class DispatcherService:
         pin = _queued_pin(task_id, request, priority, model, grant, _timestamp(self._clock))
         self.copy_job_inputs(task_id, request.inputs, grant.mode)
         self._blackboard.insert_pin(connection, pin)
+        if request.plan:
+            self._store_submitted_plan(connection, task_id, request.plan)
         position = queue_position(pin, self._blackboard.list_queued(connection))
         _log_submit(task_id, priority, model, grant.mode)
         return _queued_body(pin, position)
@@ -174,6 +177,26 @@ class DispatcherService:
             logger.info("dispatcher.copy_job_inputs | skip_copy | grant=%s", grant_mode)
         logger.info("dispatcher.copy_job_inputs | directory=%s grant=%s", directory, grant_mode)
         return directory
+
+    def _store_submitted_plan(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        actions: tuple[str, ...],
+    ) -> None:
+        """
+        Store a caller-supplied plan and publish it on the queued pin.
+
+        :param connection: open connection as sqlite3.Connection. Example: the Database connection
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param actions: step sentences as tuple[str, ...]. Example: ("Write marker.txt",)
+        :return: None. Example: None
+        """
+        drafts = tuple(StepDraft(index, action) for index, action in enumerate(actions, start=1))
+        self._plan.insert_steps(connection, task_id, drafts)
+        plan_text = self._plan.render_plan(self._plan.list_steps(connection, task_id))
+        self._blackboard.set_phase(connection, task_id, _PHASE_QUEUED, plan_text)
+        logger.info("dispatcher.submit | plan_supplied | task_id=%s steps=%s", task_id, len(drafts))
 
     def read_pin(self, task_id: str, connection: sqlite3.Connection) -> dict:
         """

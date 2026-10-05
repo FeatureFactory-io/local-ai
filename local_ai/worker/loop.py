@@ -461,6 +461,9 @@ class Worker:
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :return: True when steps were stored as bool. Example: True
         """
+        if self._plan.list_steps(self._connection, task_id):
+            logger.info("worker.task | plan_supplied | task_id=%s", task_id)
+            return True
         pin = self._require_pin(task_id)
         self._publish_phase(task_id, "planning")
         for _attempt in range(MAX_PLAN_ATTEMPTS):

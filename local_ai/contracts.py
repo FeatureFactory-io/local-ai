@@ -238,6 +238,7 @@ class SubmitRequest:
     :param model: qwen size or None as str | None. Example: "qwen-14b"
     :param inputs: file paths to copy as tuple[str, ...]. Example: ()
     :param access: grant object or None as dict | None. Example: {"mode": "job"}
+    :param plan: ordered step sentences, or None to let the worker plan. Example: ("Write marker.txt",)
     """
 
     goal: str
@@ -246,6 +247,7 @@ class SubmitRequest:
     model: str | None = None
     inputs: tuple[str, ...] = ()
     access: dict | None = None
+    plan: tuple[str, ...] | None = None
 
 
 class WorkerRunner(Protocol):
