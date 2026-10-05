@@ -73,6 +73,18 @@ Paste this as the first try:
 Call the local-ai MCP tool capacity. If ollama is up, submit a task whose goal is "Write hello.txt in the job folder containing the single word hello." and whose done_when is "hello.txt exists and its contents are hello". Use the recommended model, priority 40, and the default job access. Then call read with the returned task_id until status is completed or failed, and tell me the pin status, the error, and the job folder path.
 ```
 
+### Job control
+
+The same stdio server exposes `list`, `cancel`, and `purge`. Paste this when a pin is still `queued` and finished pins should go:
+
+```text
+Call the local-ai MCP tool list with status "queued". From jobs, take one row and note task_id and position. Call cancel with that task_id. Then call purge with no task_id and no status, so both completed and failed pins are removed. Report list status and count, the task_id and position you cancelled, cancel status and job_dir_removed, and purge status and count.
+```
+
+`list` takes optional `status` and returns `status`, `count`, and `jobs`. A queued row sets `position` to an integer. `cancel` takes `task_id` and returns `status`, `task_id`, and `job_dir_removed`. `purge` takes optional `task_id` and optional `status` (`completed` or `failed`). Omit both to delete every finished pin. It returns `status`, `count`, and `purged` (each entry has `task_id` and `job_dir_removed`).
+
+Cancel of a running `task_id` returns `status: rejected` and `reason: not_queued`. Purge of a running `task_id` returns `status: rejected` and `reason: not_terminal`.
+
 ## Claude Desktop
 
 Claude speaks the same stdio server. Add this block to `~/Library/Application Support/Claude/claude_desktop_config.json` under `mcpServers`, then quit and reopen Claude. Do not also leave the Cursor server running against the same database.
@@ -111,13 +123,25 @@ Point ChatGPT at `http://127.0.0.1:8765/mcp`. The process binds `127.0.0.1` only
 
 ## Blackboard page
 
-A read-only page renders the same pins as `list` and `read`. It does not cancel, purge, submit, or reprioritize, and it does not migrate the database.
+A read-only page renders the same pins as `list` and `read`. It does not cancel, purge, submit, or reprioritize, and it does not migrate the database. Queued and running jobs are expanded and show the plan, the steps, and the reasoning.
+
+From this repo:
 
 ```bash
 .venv/bin/python -m local_ai.board
 ```
 
 Open `http://127.0.0.1:8766/`. The process binds `127.0.0.1` only. `LOCAL_AI_BOARD_PORT` defaults to `8766` so it does not take the MCP HTTP port. `LOCAL_AI_DB` is the same SQLite file the dispatcher uses. The query `status` accepts `queued`, `running`, `completed`, `failed`, or `all` (the default). Any other value is rejected with HTTP 400 and `reason: bad_status`.
+
+```text
+http://127.0.0.1:8766/?status=queued
+http://127.0.0.1:8766/?status=running
+http://127.0.0.1:8766/?status=completed
+http://127.0.0.1:8766/?status=failed
+http://127.0.0.1:8766/?status=all
+```
+
+`http://127.0.0.1:8766/` and `?status=all` are the same filter.
 
 ## Tests
 
