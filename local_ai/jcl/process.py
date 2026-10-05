@@ -7,9 +7,10 @@ from dataclasses import dataclass
 
 from flask import Flask
 
-from local_ai.dispatcher.server import compose
+from local_ai.dispatcher.server import LocalAiServer, compose
 from local_ai.jcl.app import create_app
-from local_ai.jcl.tokens import load_token_table
+from local_ai.jcl.register import CONFIG_REGISTER, RegisterSettings, register_settings, start_refresh, urllib_poster
+from local_ai.jcl.tokens import TokenTable, load_token_table
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ def prepare(env: Mapping[str, str] | None = None) -> tuple[Flask, BindSettings]:
     :param env: environment as Mapping[str, str] | None. Example: {"LOCAL_AI_JCL_TOKEN_50": "lane-50-secret"}
     :return: app and bind settings as tuple[Flask, BindSettings]. Example: (app, BindSettings("127.0.0.1", 8770))
     :raises TokenTableError: when no JCL token is set. Example: {}
+    :raises RegisterConfigError: when a catalog URL has no advertise URL. Example: {"LOCAL_AI_CATALOG_URL": "http://192.168.1.40:8771"}
     :raises ValueError: when the port is outside 1..65535. Example: "0"
     :raises TypeError: when env is not a mapping. Example: []
     """
@@ -66,9 +68,12 @@ def prepare(env: Mapping[str, str] | None = None) -> tuple[Flask, BindSettings]:
     source = _environment(env)
     tokens = load_token_table(source)
     settings = bind_settings(source)
+    catalog = register_settings(source)
     server, _mcp = compose(source)
+    application = create_app(server, tokens)
+    application.config[CONFIG_REGISTER] = catalog
     logger.info("prepare | exit | host=%s port=%s", settings.host, settings.port)
-    return create_app(server, tokens), settings
+    return application, settings
 
 
 def main() -> None:
@@ -77,10 +82,12 @@ def main() -> None:
 
     :return: None. Example: None
     :raises TokenTableError: when no JCL token is set. Example: {}
+    :raises RegisterConfigError: when a catalog URL has no advertise URL. Example: {"LOCAL_AI_CATALOG_URL": "http://192.168.1.40:8771"}
     :raises ValueError: when the port is outside 1..65535. Example: "0"
     """
     logger.info("main | entry")
     application, settings = prepare(None)
+    _start_catalog_refresh(application)
     _serve(application, settings)
 
 
@@ -133,6 +140,24 @@ def _port(raw: object) -> int:
     if port < _MIN_PORT or port > _MAX_PORT:
         raise ValueError("LOCAL_AI_JCL_PORT must be from 1 through 65535. Example: 8770")
     return port
+
+
+def _start_catalog_refresh(application: Flask) -> None:
+    """
+    Start registration when a catalog URL was configured. Otherwise return.
+
+    :param application: flask app as Flask. Example: the app from prepare
+    :return: None. Example: None
+    :raises TypeError: when the app is missing its server, tokens, or register settings. Example: Flask(__name__)
+    """
+    server = application.config.get("JCL_SERVER")
+    tokens = application.config.get("JCL_TOKENS")
+    catalog = application.config.get(CONFIG_REGISTER)
+    if not isinstance(server, LocalAiServer) or not isinstance(tokens, TokenTable):
+        raise TypeError("the JCL app is missing its server or tokens")
+    if not isinstance(catalog, RegisterSettings):
+        raise TypeError("the JCL app is missing register settings")
+    start_refresh(server, tokens, catalog, urllib_poster, None)
 
 
 def _serve(application: Flask, settings: BindSettings) -> None:
