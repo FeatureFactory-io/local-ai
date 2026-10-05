@@ -115,8 +115,10 @@ The process binds `127.0.0.1` only. `LOCAL_AI_BOARD_PORT` defaults to `8766` so 
 |--------|-----------|
 | Cursor, Claude Desktop | stdio |
 | ChatGPT | streamable HTTP on a localhost port |
+| Remote curl | JCL HTTP, `python -m local_ai.jcl` |
+| Catalog reader | HTTP, `python -m local_ai.catalog` |
 
-Both transports call the same dispatcher methods.
+The MCP transports and the JCL routes call the same dispatcher methods. The catalog is a phone book of hosts, not a second queue. Each host still runs one worker. `POST /register` does not require a token. `GET /hosts` requires `LOCAL_AI_CATALOG_TOKEN`.
 
 ### Tool inventory
 
@@ -149,8 +151,11 @@ local_ai/
   prompt/         three prompt layers
   capacity/       memory and Ollama /api/ps
   db/             SQLite schema and migrations
+  jcl/            token-gated HTTP job control
+  catalog/        host phone book
 logs/app.log
 data/local-ai.sqlite
+data/catalog.sqlite
 data/jobs/<task_id>/
 ```
 
@@ -319,6 +324,18 @@ The same `task_id` is the correlation id on every line for that job. Reasoning t
 | `LOCAL_AI_DB` | SQLite path, default `data/local-ai.sqlite` |
 | `LOCAL_AI_JOBS` | Job root, default `data/jobs` |
 | `LOCAL_AI_HTTP_PORT` | Set only for the ChatGPT HTTP transport |
+| `LOCAL_AI_JCL_TOKEN_<priority>` | Bearer secret whose best priority is the suffix, 1..100 |
+| `LOCAL_AI_JCL_HOST` | JCL bind address, default `127.0.0.1` |
+| `LOCAL_AI_JCL_PORT` | JCL port, default `8770` |
+| `LOCAL_AI_CATALOG_URL` | Optional catalog base URL. Requires `LOCAL_AI_ADVERTISE_URL` |
+| `LOCAL_AI_ADVERTISE_URL` | URL other machines curl to reach this JCL host |
+| `LOCAL_AI_HOST_NAME` | Name sent to the catalog. Default is the machine hostname |
+| `LOCAL_AI_CATALOG_REFRESH_S` | Seconds between catalog posts, default `60` |
+| `LOCAL_AI_CATALOG_TOKEN` | Bearer secret for `GET /hosts` |
+| `LOCAL_AI_CATALOG_HOST` | Catalog bind address, default `127.0.0.1` |
+| `LOCAL_AI_CATALOG_PORT` | Catalog port, default `8771` |
+| `LOCAL_AI_CATALOG_DB` | Catalog sqlite path, default `data/catalog.sqlite` |
+| `LOCAL_AI_CATALOG_STALE_S` | Age in seconds after which a host is marked stale, default `180` |
 
 No cloud API key. Ollama is local.
 
@@ -326,7 +343,7 @@ No cloud API key. Ollama is local.
 
 The shell is the worker's only tool. Before a command runs, the dispatcher resolves every path argument and the working directory against the grant. A path outside the grant returns `error: access_denied` and does not execute. `mode: home` is an explicit grant on that job, stored on the pin so a later `read` shows what the worker was allowed to touch.
 
-The MCP server binds stdio for local IDE clients. The HTTP transport binds `127.0.0.1` only.
+The MCP server binds stdio for local IDE clients. The MCP HTTP transport binds `127.0.0.1` only. The JCL API may bind a non-loopback host because every route requires a bearer token. Its default bind remains `127.0.0.1`.
 
 ## 14. Backup & Recovery
 
@@ -458,7 +475,7 @@ The dispatcher writes `status: failed` and `error` on the pin and releases the s
 ### Integration case
 
 - **Chosen**: Case A, service bridge. The MCP handlers call dispatcher functions in-process.
-- **Rationale**: The queue and the worker share one SQLite file and one slot. An HTTP facade in front of those functions would be a second process with nothing to add.
+- **Rationale**: The queue and the worker share one SQLite file and one slot. MCP handlers call those functions in-process. The JCL process is the same wiring served over HTTP for a remote caller, and it remains the only writer of that sqlite file.
 
 ### Transport topology
 
@@ -466,10 +483,16 @@ The dispatcher writes `status: failed` and `error` on the pin and releases the s
 |--------|-----------|------|
 | Cursor, Claude Desktop | stdio | n/a |
 | ChatGPT | streamable HTTP | `127.0.0.1:$LOCAL_AI_HTTP_PORT` |
+| Remote curl | JCL HTTP | `$LOCAL_AI_JCL_HOST:$LOCAL_AI_JCL_PORT`, default `127.0.0.1:8770` |
+| Catalog | HTTP | `$LOCAL_AI_CATALOG_HOST:$LOCAL_AI_CATALOG_PORT`, default `127.0.0.1:8771` |
 
 ### Auth
 
-Local process user. The HTTP transport has no token while it stays on localhost. A non-loopback bind is out of scope until an auth decision is added here.
+Local process user. The MCP HTTP transport has no token while it stays on localhost. A non-loopback bind of that MCP transport stays out of scope.
+
+The JCL API is the non-loopback surface. It refuses to bind unless at least one `LOCAL_AI_JCL_TOKEN_<priority>` is set. The suffix is that token's best priority. Submit and reprioritize may use that priority or any worse one (a larger integer). Any accepted token may call capacity, read, list, cancel, and purge. A missing or unknown token is HTTP 401 `reason: unauthorized`. A better priority is HTTP 403 `reason: priority_forbidden`. Domain results, including `rejected`, stay HTTP 200. The token value is not logged.
+
+The catalog process refuses to bind unless `LOCAL_AI_CATALOG_TOKEN` is set. `GET /hosts` requires that bearer token. `POST /register` does not. The listing includes each host's priority tokens so a frontier model can curl the host. A row older than `LOCAL_AI_CATALOG_STALE_S` (default 180 seconds) is returned with `stale: true` and is not deleted.
 
 ### Stdout hygiene
 

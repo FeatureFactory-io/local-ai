@@ -2,7 +2,7 @@
 
 A dispatcher that lets Cursor, Claude Desktop, or ChatGPT hand one task at a time to a local Qwen model served by Ollama. The frontier model never gets a shell. It calls the dispatcher MCP tools. The dispatcher pins the task, runs one worker, and writes progress on the pin.
 
-The contract is [docs/SAO.md](docs/SAO.md). This file is how to start that server and attach it.
+The contract is [docs/SAO.md](docs/SAO.md). This file is how to start that server and attach it. A JCL process exposes the same tools over HTTP so a frontier model can curl another machine. An optional catalog lists those machines.
 
 ## Before the first call
 
@@ -54,6 +54,18 @@ A rejected call is still a normal MCP result. Check `status`. `rejected` with `r
 | `LOCAL_AI_MODEL_24B` | tag from `ollama list` | Ollama name for `qwen-24b` |
 | `LOCAL_AI_HTTP_PORT` | unset for stdio | Set only for the ChatGPT HTTP transport |
 | `LOCAL_AI_BOARD_PORT` | `8766` | Read-only blackboard page. Binds `127.0.0.1` only |
+| `LOCAL_AI_JCL_TOKEN_<priority>` | required to serve JCL | Bearer secret. The suffix is the best priority that token may set |
+| `LOCAL_AI_JCL_HOST` | `127.0.0.1` | Set to `0.0.0.0` when another machine will curl this host |
+| `LOCAL_AI_JCL_PORT` | `8770` | JCL API port |
+| `LOCAL_AI_CATALOG_URL` | unset | Catalog base URL. When set, `LOCAL_AI_ADVERTISE_URL` is required |
+| `LOCAL_AI_ADVERTISE_URL` | unset | URL other machines use to reach this JCL API |
+| `LOCAL_AI_HOST_NAME` | machine hostname | Name stored on the catalog |
+| `LOCAL_AI_CATALOG_REFRESH_S` | `60` | Seconds between catalog registration posts |
+| `LOCAL_AI_CATALOG_TOKEN` | required to serve the catalog | Bearer secret for `GET /hosts` |
+| `LOCAL_AI_CATALOG_HOST` | `127.0.0.1` | Set to `0.0.0.0` on the catalog machine when other hosts must reach it |
+| `LOCAL_AI_CATALOG_PORT` | `8771` | Catalog port |
+| `LOCAL_AI_CATALOG_DB` | `data/catalog.sqlite` | Catalog phone book. Not the dispatcher database |
+| `LOCAL_AI_CATALOG_STALE_S` | `180` | Age after which a listed host is marked stale |
 
 The logical names `qwen-8b`, `qwen-14b`, and `qwen-24b` are what `submit` stores. The `LOCAL_AI_MODEL_*` variables are the tags Ollama actually runs. This machine maps `qwen-8b` to `qwen3.5:9b`, `qwen-14b` to `qwen3:14b`, and `qwen-24b` to `qwen3.5:27b`. Qwen3.5 has no 14B tag. Change the variables if `ollama list` changes.
 
@@ -121,6 +133,83 @@ LOCAL_AI_MODEL_24B=qwen3.5:27b \
 ```
 
 Point ChatGPT at `http://127.0.0.1:8765/mcp`. The process binds `127.0.0.1` only.
+
+## JCL API
+
+`python -m local_ai.jcl` runs the same dispatcher and the same worker as the MCP server, then serves the seven tools as POST routes. Do not run it against a database that another dispatcher process already has open.
+
+The process reads tokens once at startup. The variable suffix is a priority from 1 (first) through 100 (last). That number is the best priority the token may set. Submit and reprioritize may use it or any worse priority, which is a larger integer. If submit omits `priority`, the pin uses the token's number. Any accepted token may call capacity, read, list, cancel, and purge.
+
+The process refuses to listen when no token is set. The default bind is `127.0.0.1:8770`. Set `LOCAL_AI_JCL_HOST=0.0.0.0` when another machine on the LAN will curl this one. `inputs` are paths on this host.
+
+From this repo:
+
+```bash
+LOCAL_AI_JCL_TOKEN_10=replace-with-a-long-secret \
+LOCAL_AI_JCL_TOKEN_50=replace-with-another-secret \
+LOCAL_AI_JCL_HOST=0.0.0.0 \
+LOCAL_AI_JCL_PORT=8770 \
+OLLAMA_HOST=http://127.0.0.1:11434 \
+LOCAL_AI_DB=/Users/denispetelin/local-ai/data/local-ai.sqlite \
+LOCAL_AI_JOBS=/Users/denispetelin/local-ai/data/jobs \
+LOCAL_AI_MODEL_8B=qwen3.5:9b \
+LOCAL_AI_MODEL_14B=qwen3:14b \
+LOCAL_AI_MODEL_24B=qwen3.5:27b \
+.venv/bin/python -m local_ai.jcl
+```
+
+Submit a task with the lane-50 token. The response `status` is `queued` even when the worker starts immediately. Repeat `read` until it is `completed` or `failed`.
+
+```bash
+curl -s -X POST http://127.0.0.1:8770/jcl/submit \
+  -H "Authorization: Bearer replace-with-another-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"goal":"Write hello.txt in the job folder containing the single word hello.","done_when":"hello.txt exists and its contents are hello"}'
+```
+
+| Route | Body |
+|-------|------|
+| `POST /jcl/capacity` | empty object |
+| `POST /jcl/submit` | `goal`, `done_when`, optional `priority`, `model`, `inputs`, `access`, `plan` |
+| `POST /jcl/read` | `task_id` |
+| `POST /jcl/reprioritize` | `task_id`, `priority` |
+| `POST /jcl/list` | optional `status` |
+| `POST /jcl/cancel` | `task_id` |
+| `POST /jcl/purge` | optional `task_id`, optional `status` |
+
+Every route takes `Authorization: Bearer <token>`. A missing or unknown token is HTTP 401 `reason: unauthorized`. A priority better than the token allows is HTTP 403 `reason: priority_forbidden`. A body that is not a JSON object is HTTP 400 `reason: bad_json`. Dispatcher results, including `rejected`, stay HTTP 200 and use the same JSON as the MCP tools. The log records the route, the decision, and the priority. It does not record the token.
+
+## Catalog
+
+A catalog host, which can be a small machine such as a Pi, lists JCL hosts and the tokens, capacity, and models they last reported. It does not run Ollama or a worker. Its database is `data/catalog.sqlite`, not the dispatcher database.
+
+On the catalog machine:
+
+```bash
+LOCAL_AI_CATALOG_TOKEN=replace-with-a-catalog-secret \
+LOCAL_AI_CATALOG_HOST=0.0.0.0 \
+LOCAL_AI_CATALOG_PORT=8771 \
+.venv/bin/python -m local_ai.catalog
+```
+
+The default bind is `127.0.0.1:8771`. The process refuses to listen when `LOCAL_AI_CATALOG_TOKEN` is unset. `POST /register` does not check a token. `GET /hosts` requires the catalog token. That listing includes every host token, so the catalog token is the key to those secrets.
+
+On each JCL machine, add the catalog URL and the URL other machines should curl. `LOCAL_AI_ADVERTISE_URL` is required when `LOCAL_AI_CATALOG_URL` is set. Without the advertise URL the JCL process does not open its database. The host posts at startup and again every `LOCAL_AI_CATALOG_REFRESH_S` seconds (default 60). A failed post is logged and the JCL API keeps serving.
+
+```bash
+LOCAL_AI_CATALOG_URL=http://192.168.1.40:8771 \
+LOCAL_AI_ADVERTISE_URL=http://192.168.1.20:8770 \
+LOCAL_AI_HOST_NAME=studio-mac \
+```
+
+Read the phone book:
+
+```bash
+curl -s http://192.168.1.40:8771/hosts \
+  -H "Authorization: Bearer replace-with-a-catalog-secret"
+```
+
+Each host has `name`, `advertise_url`, `tokens`, `capacity`, `models`, `last_seen`, and `stale`. A row older than `LOCAL_AI_CATALOG_STALE_S` seconds (default 180) has `stale: true` and stays in the list. Use the advertise URL and one of that host's tokens to POST `/jcl/submit` on that machine.
 
 ## Blackboard page
 
