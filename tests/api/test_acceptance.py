@@ -38,6 +38,7 @@ class _OllamaHandler(BaseHTTPRequestHandler):
     """Answers the two capacity GETs and the chat posts the worker sends."""
 
     replies: list[dict] = []
+    chat_posts: int = 0
 
     def do_GET(self) -> None:
         """Return tags or the loaded model. Anything else is 404."""
@@ -56,6 +57,7 @@ class _OllamaHandler(BaseHTTPRequestHandler):
         if self.path.split("?", 1)[0] != "/api/chat":
             self.send_error(404)
             return
+        type(self).chat_posts += 1
         if not type(self).replies:
             self.send_error(500, "no chat reply left")
             return
@@ -238,6 +240,60 @@ def test_stdio_client_keeps_a_prose_reply_and_does_not_finish(tmp_path: Path) ->
     _assert_stdout_is_only_jsonrpc(stdout)
 
 
+_CAP_GOAL = "Write marker.txt in the job folder."
+_CAP_DONE = "marker.txt exists"
+_FIRST_FAIL = "false"
+_SECOND_FAIL = "python3 -c \"import sys; sys.stderr.write('step-two\\n'); raise SystemExit(2)\""
+_THIRD_FAIL = "python3 -c \"import sys; sys.stderr.write('step-three\\n'); raise SystemExit(3)\""
+
+
+def test_stdio_client_stops_after_three_failed_steps(tmp_path: Path) -> None:
+    """Three different failing commands fail the pin and do not ask for a fourth reply."""
+    assert len({_FIRST_FAIL, _SECOND_FAIL, _THIRD_FAIL}) == 3
+    host, port, server = _start_ollama(_three_failures())
+    process = _start_dispatcher(tmp_path, host, port)
+    stdout: list[str] = []
+    try:
+        _send(process, _initialize())
+        _response(process, 1, stdout)
+        _send(process, _initialized())
+        accepted = _tool(process, 2, "submit", _cap_submit(), stdout)
+        pin = _poll_until_terminal(process, str(accepted["task_id"]), stdout)
+    finally:
+        _stop(process)
+        server.shutdown()
+
+    failed = [step for step in pin["steps"] if step["status"] == "failed"]
+    assert accepted["status"] == "queued"
+    assert pin["status"] == "failed"
+    assert pin["error"] == "failed_step_cap"
+    assert len(failed) == 3
+    assert len(pin["steps"]) == 3
+    assert _OllamaHandler.chat_posts == 3
+    assert any("failed_step_cap" in note["text"] and "3" in note["text"] for note in pin["reasoning"])
+    _assert_stdout_is_only_jsonrpc(stdout)
+
+
+def _three_failures() -> list[dict]:
+    """Plan with one failing command, then two different failing replacements."""
+    return [
+        _chat("", thinking="Trying the first command.", command=_FIRST_FAIL),
+        _chat("Run a different check", thinking="The first command failed.", command=_SECOND_FAIL),
+        _chat("Run one more check", thinking="The second command failed.", command=_THIRD_FAIL),
+    ]
+
+
+def _cap_submit() -> dict:
+    """The submit a person would send for the failed-step cap."""
+    return {
+        "goal": _CAP_GOAL,
+        "done_when": _CAP_DONE,
+        "priority": 40,
+        "model": "qwen-14b",
+        "access": {"mode": "job"},
+    }
+
+
 def _write_chapters(tmp_path: Path) -> list[str]:
     """Write the two source chapters and return their paths."""
     folder = tmp_path / "chapters"
@@ -295,6 +351,7 @@ def _code_submit() -> dict:
 def _start_ollama(replies: list[dict]) -> tuple[str, int, ThreadingHTTPServer]:
     """Bind a stand-in Ollama on an ephemeral port."""
     _OllamaHandler.replies = replies
+    _OllamaHandler.chat_posts = 0
     socket_server = ThreadingHTTPServer(("127.0.0.1", 0), _OllamaHandler)
     threading.Thread(target=socket_server.serve_forever, daemon=True).start()
     host, port = socket_server.server_address[:2]

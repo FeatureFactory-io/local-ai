@@ -10,6 +10,7 @@ from pathlib import Path
 
 from local_ai.blackboard.pins import Blackboard
 from local_ai.contracts import (
+    MAX_FAILED_STEPS,
     MAX_IDENTICAL_FAILURES,
     MAX_ROUNDS_PER_STEP,
     AccessGrant,
@@ -36,6 +37,7 @@ _COMMAND_CLIP = 180
 _NOTE_CLIP = 400
 _MAX_SHELL_CONTINUATIONS = 3
 _SHELL_PLAN_NOT_THE_GOAL = "shell_plan_not_the_goal"
+_FAILED_STEP_CAP = "failed_step_cap"
 _MIN_STEP_ORDER = 1
 
 
@@ -706,7 +708,7 @@ class Worker:
 
     def _run_or_adapt(self, task_id: str, order: int, model_name: str) -> str:
         """
-        Run one step. A shell failure adapts unless the command has failed three times.
+        Run one step. Stop when failed steps hit the cap or one command failed three times.
 
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param order: step order as int. Example: 1
@@ -718,10 +720,54 @@ class Worker:
         command = self._failed_command
         if command is None or self.note_identical_failure(task_id, order, command):
             return "failed"
+        if self._stop_at_failed_step_cap(task_id, order):
+            return "failed"
         self.adapt_after_failure(task_id, order, model_name, self._failed_error)
         if self.failure_reason:
             return "failed"
         return "adapted"
+
+    def _stop_at_failed_step_cap(self, task_id: str, order: int) -> bool:
+        """
+        Fail the pin when failed steps have reached the cap.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step that just failed as int. Example: 3
+        :return: True when the pin stops as bool. Example: False
+        """
+        count = _count_failed_steps(self._plan.list_steps(self._connection, task_id))
+        if count < MAX_FAILED_STEPS:
+            logger.info(
+                "worker.failure | below cap | task_id=%s step=%s failed_steps=%s",
+                task_id,
+                order,
+                count,
+            )
+            return False
+        self._note_failed_step_cap(task_id, order, count)
+        return True
+
+    def _note_failed_step_cap(self, task_id: str, order: int, count: int) -> None:
+        """
+        Record failed_step_cap so a read of the pin shows why it stopped.
+
+        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+        :param order: step that just failed as int. Example: 3
+        :param count: failed steps as int. Example: 3
+        :return: None. Example: None
+        """
+        self.failure_reason = _FAILED_STEP_CAP
+        self._blackboard.append_reasoning(
+            self._connection,
+            task_id,
+            ReasoningNote(_utc_now(), order, f"{_FAILED_STEP_CAP}: {count} failed steps"),
+        )
+        logger.info(
+            "worker.failure | failed_step_cap | task_id=%s step=%s count=%s",
+            task_id,
+            order,
+            count,
+        )
 
     def _insert_replacement(self, task_id: str, order: int, model_name: str, error: str) -> int | None:
         """
@@ -984,6 +1030,19 @@ def _require_step_args(task_id: str, order: int, model_name: str) -> None:
     :raises ValueError: when task_id, order, or model_name is unusable. Example: ""
     """
     _require_round_args(task_id, order, "", model_name)
+
+
+def _count_failed_steps(steps: tuple[PlanStep, ...]) -> int:
+    """
+    Count steps whose status is failed.
+
+    :param steps: ordered steps as tuple[PlanStep, ...]. Example: ()
+    :return: count as int. Example: 3
+    :raises TypeError: when steps is not a tuple. Example: []
+    """
+    if not isinstance(steps, tuple):
+        raise TypeError("steps must be a tuple. Example: ()")
+    return sum(1 for step in steps if step.status == "failed")
 
 
 def _shell_failed(had_shell: bool, envelope: ToolEnvelope | None) -> bool:
