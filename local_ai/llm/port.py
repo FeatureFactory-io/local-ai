@@ -46,6 +46,7 @@ class ScriptedLLM(LlmPort):
         # Remember the script and an index at 0.
         self._script = script
         self._index = 0
+        self.prompts: list[str] = []
 
     def complete(self, prompt: str, model_name: str) -> Completion:
         """
@@ -63,6 +64,7 @@ class ScriptedLLM(LlmPort):
             model_name,
         )
         self._require_turn_request(prompt, model_name)
+        self.prompts.append(prompt)
         turn = self._next_scripted_turn(model_name)
         logger.info(
             "ScriptedLLM.complete returned index=%s model_name=%s",

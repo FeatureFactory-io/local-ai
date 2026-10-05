@@ -593,15 +593,20 @@ class Worker:
 
     def _close_or_stop_shell_plan(self, task_id: str, completion: Completion) -> str:
         """
-        Accept a final answer. An empty follow-up means the goal is still open.
+        Keep a prose reply on the pin. Prose does not finish the goal.
 
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
-        :param completion: follow-up turn as Completion. Example: Completion(final_answer="The thesis is written.")
-        :return: status as str. Example: "completed"
+        :param completion: follow-up turn as Completion. Example: Completion(final_answer="The thesis is the canvas.")
+        :return: "failed" as str. Example: "failed"
         """
-        if completion.final_answer.strip():
-            logger.info("worker.task | shell_plan_closed | task_id=%s", task_id)
-            return "completed"
+        text = _follow_up_text(completion)
+        if text:
+            self._blackboard.append_reasoning(
+                self._connection,
+                task_id,
+                ReasoningNote(_utc_now(), self._next_order(task_id) - 1, text),
+            )
+            logger.info("worker.task | shell_plan_prose | task_id=%s reply_len=%s", task_id, len(text))
         return self._stop_unfinished_shell_plan(task_id)
 
     def _stop_unfinished_shell_plan(self, task_id: str) -> str:
@@ -634,17 +639,26 @@ class Worker:
 
     def _continuation_prompt(self, task_id: str) -> str:
         """
-        Tell the model the shell command finished and the goal is still open.
+        Tell the model the shell command finished and show that command's result.
 
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
-        :return: prompt as str. Example: "Foundation\\n\\nThe planning turn was only a shell command."
+        :return: prompt as str. Example: "Foundation\\nPrior synthesis: step 1: pdftotext\\nexit 0"
         """
-        prompt = self._planning_prompt(self._require_pin(task_id))
+        pin = self._require_pin(task_id)
+        last_result = pin.reasoning[-1].text if pin.reasoning else ""
+        prompt = self._prompt.assemble(
+            pin.goal,
+            pin.done_when,
+            pin.access,
+            (),
+            pin.current_plan,
+            last_result,
+        )
         return (
             prompt
-            + "\n\nThe planning turn was only a shell command, and that command has finished. "
-            + "It is not the goal. Reply with the remaining numbered steps. "
-            + "Reply with a final answer only when the goal is already met."
+            + "\n\nThe shell command finished. That command is not the goal. "
+            + "Reply with the remaining numbered steps, or one shell command that writes the result. "
+            + "A prose reply does not finish the task."
         )
 
     def _planning_prompt(self, pin: TaskPin) -> str:
@@ -814,6 +828,16 @@ def _shell_note(order: int, command: str, envelope: ToolEnvelope) -> str:
     else:
         body = f"step {order} failed: {head}\n{envelope.error}"
     return _clip(body.strip(), _NOTE_CLIP)
+
+
+def _follow_up_text(completion: Completion) -> str:
+    """
+    Take the prose the model returned when it did not call a tool.
+
+    :param completion: follow-up turn as Completion. Example: Completion(final_answer="The thesis is the canvas.")
+    :return: reply as str. Example: "The thesis is the canvas."
+    """
+    return completion.final_answer.strip() or completion.content.strip()
 
 
 def _shifted_drafts(drafts: list[StepDraft], start: int) -> tuple[StepDraft, ...]:
