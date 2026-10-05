@@ -1,7 +1,6 @@
 """Token-gated JCL routes on a real sqlite file and a ScriptedLLM worker."""
 
 import logging
-import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,7 +31,11 @@ _PS = f"{_HOST}/api/ps"
 _LANE_10 = "lane-10-secret"
 _LANE_50 = "lane-50-secret"
 _JOIN_TIMEOUT_S = 8.0
-_HOLD_COMMAND = "python3 -c \"open('awake.txt','w').write('1'); import time; time.sleep(2)\""
+_HOLD_COMMAND = (
+    "python3 -c \"import pathlib,time; pathlib.Path('awake.txt').write_text('1'); "
+    "p=pathlib.Path('release.txt'); "
+    "[time.sleep(0.05) for _ in range(300) if not p.exists()]\""
+)
 _HOLD_SCRIPT = (
     Completion(content="1. Pause in the job folder"),
     Completion(tool_calls=(ToolCall("shell", _HOLD_COMMAND),), final_answer="Paused"),
@@ -153,6 +156,7 @@ def test_job_control_routes_follow_the_dispatcher(
     assert_log_story(caplog.records, "jcl.submit", "exit", ["priority=50", "status=queued"])
     assert _LANE_10 not in caplog.text
     assert _LANE_50 not in caplog.text
+    _release(tmp_path, first_id)
     _join(server)
 
 
@@ -296,16 +300,28 @@ def _task(priority: int | None = None, goal: str = _GOAL) -> dict:
     return body
 
 
+def _release(tmp_path: Path, task_id: str) -> None:
+    """
+    Let the holding worker exit. The shell waits until release.txt exists.
+
+    :param tmp_path: pytest directory as Path. Example: Path("/tmp/pytest/test0")
+    :param task_id: running pin as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
+    :return: None. Example: None
+    """
+    job = tmp_path / "jobs" / task_id
+    job.mkdir(parents=True, exist_ok=True)
+    (job / "release.txt").write_text("go", encoding="utf-8")
+
+
 def _join(server: LocalAiServer) -> None:
     """
-    Wait until the slot thread finishes.
+    Wait until the slot thread finishes. A thread that already exited is done.
 
     :param server: dispatcher surface as LocalAiServer. Example: the test server
     :return: None. Example: None
     """
-    deadline = time.time() + _JOIN_TIMEOUT_S
     thread = server._slot._thread
-    assert thread is not None
-    remaining = max(0.0, deadline - time.time())
-    thread.join(timeout=remaining)
+    if thread is None:
+        return
+    thread.join(timeout=_JOIN_TIMEOUT_S)
     assert not thread.is_alive()
