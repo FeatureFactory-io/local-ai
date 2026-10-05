@@ -12,6 +12,7 @@ from local_ai.blackboard.pins import Blackboard
 from local_ai.contracts import (
     MAX_FAILED_STEPS,
     MAX_IDENTICAL_FAILURES,
+    MAX_PLAN_ATTEMPTS,
     MAX_ROUNDS_PER_STEP,
     AccessGrant,
     Completion,
@@ -35,8 +36,6 @@ _NAMED_OUTPUT = re.compile(r"\b[\w][\w.-]*\.(?:md|txt|py|pdf)\b")
 _TEXT_SUFFIXES = frozenset({".md", ".txt", ".py"})
 _COMMAND_CLIP = 180
 _NOTE_CLIP = 400
-_MAX_SHELL_CONTINUATIONS = 3
-_SHELL_PLAN_NOT_THE_GOAL = "shell_plan_not_the_goal"
 _FAILED_STEP_CAP = "failed_step_cap"
 _MIN_STEP_ORDER = 1
 
@@ -85,7 +84,6 @@ class Worker:
         self._failed_error = ""
         self._identical: dict[str, tuple[str, int]] = {}
         self._seed_command: str | None = None
-        self._shell_only_plan = False
         self.failure_reason = ""
         self.trace: list[dict[str, str]] = []
 
@@ -100,13 +98,10 @@ class Worker:
         logger.info("Starting run_task task_id=%s", task_id)
         _require_task_id(task_id)
         self.failure_reason = ""
-        self._shell_only_plan = False
         if not self._store_planned_steps(task_id):
             self.failure_reason = "empty_plan"
             return "failed"
         outcome = self._run_pending_steps(task_id, self._require_pin(task_id).model)
-        if outcome == "completed" and self._shell_only_plan:
-            outcome = self._continue_after_shell(task_id)
         outcome = self._reject_if_result_missing(task_id, outcome)
         logger.info("worker.task | finished | task_id=%s status=%s", task_id, outcome)
         return outcome
@@ -468,15 +463,18 @@ class Worker:
         """
         pin = self._require_pin(task_id)
         self._publish_phase(task_id, "planning")
-        completion = self._llm.complete(self._planning_prompt(pin), pin.model)
-        if not self._insert_parsed_plan(task_id, completion):
-            return False
-        self._publish_phase(task_id, "planning")
-        return True
+        for _attempt in range(MAX_PLAN_ATTEMPTS):
+            completion = self._llm.complete(self._planning_prompt(pin), pin.model)
+            if self._insert_numbered_plan(task_id, completion):
+                self._publish_phase(task_id, "planning")
+                return True
+            logger.info("worker.task | plan_rejected | task_id=%s", task_id)
+        logger.info("worker.task | failed | task_id=%s reason=empty_plan", task_id)
+        return False
 
-    def _insert_parsed_plan(self, task_id: str, completion: Completion) -> bool:
+    def _insert_numbered_plan(self, task_id: str, completion: Completion) -> bool:
         """
-        Parse and insert drafts. ValueError means the pin stops.
+        Insert numbered steps. A reply with no step is not a plan.
 
         :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
         :param completion: planning turn as Completion. Example: Completion(content="1. List chapter files")
@@ -485,27 +483,9 @@ class Worker:
         try:
             drafts = self.parse_plan(completion)
         except ValueError:
-            drafts = self._draft_from_shell(completion)
-            if drafts is None:
-                logger.info("worker.task | failed | task_id=%s reason=empty_plan", task_id)
-                return False
+            return False
         self._plan.insert_steps(self._connection, task_id, drafts)
         return True
-
-    def _draft_from_shell(self, completion: Completion) -> tuple[StepDraft, ...] | None:
-        """
-        Turn a planning tool call into one step when the model skipped the numbered plan.
-
-        :param completion: planning turn as Completion. Example: Completion(tool_calls=(ToolCall("shell", "printf marker"),))
-        :return: one draft or None as tuple[StepDraft, ...] | None. Example: (StepDraft(1, "Run the shell command from the planning turn"),)
-        """
-        command = _shell_command(completion)
-        if not command:
-            return None
-        self._seed_command = command
-        self._shell_only_plan = True
-        logger.info("worker.task | plan_from_shell")
-        return (StepDraft(1, "Run the shell command from the planning turn"),)
 
     def _run_seed_command(self, task_id: str, order: int) -> str | None:
         """
@@ -527,141 +507,7 @@ class Worker:
         if _shell_failed(self._round_had_shell, self._last_envelope):
             error = self._last_envelope.error if self._last_envelope is not None else ""
             return self._fail_open_step(task_id, order, error)
-        return self._complete_open_step(task_id, order, "Ran the shell command from the planning turn")
-
-    def _continue_after_shell(self, task_id: str) -> str:
-        """
-        Ask for the rest of the goal after a shell-only plan.
-
-        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
-        :return: status as str. Example: "failed"
-        """
-        model_name = self._require_pin(task_id).model
-        for _index in range(_MAX_SHELL_CONTINUATIONS):
-            outcome = self._follow_shell_plan(task_id, model_name)
-            if outcome != "again":
-                return outcome
-        return self._stop_unfinished_shell_plan(task_id)
-
-    def _follow_shell_plan(self, task_id: str, model_name: str) -> str:
-        """
-        Take one follow-up turn. A further shell command means ask again.
-
-        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
-        :param model_name: logical size as str. Example: "qwen-14b"
-        :return: status or "again" as str. Example: "again"
-        """
-        completion = self._llm.complete(self._continuation_prompt(task_id), model_name)
-        kind = self._store_follow_up(task_id, completion)
-        if kind == "none":
-            return self._close_or_stop_shell_plan(task_id, completion)
-        outcome = self._run_pending_steps(task_id, model_name)
-        if outcome != "completed" or kind == "numbered":
-            return outcome
-        return "again"
-
-    def _store_follow_up(self, task_id: str, completion: Completion) -> str:
-        """
-        Insert the remaining plan, or one more shell step.
-
-        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
-        :param completion: follow-up turn as Completion. Example: Completion(content="1. Write the thesis")
-        :return: "numbered", "shell", or "none" as str. Example: "numbered"
-        """
-        drafts = _drafts_from_completion(completion)
-        if drafts:
-            self._shell_only_plan = False
-            self._insert_follow_up(task_id, _shifted_drafts(drafts, self._next_order(task_id)))
-            return "numbered"
-        command = _shell_command(completion)
-        if not command:
-            return "none"
-        self._seed_command = command
-        self._shell_only_plan = True
-        self._insert_follow_up(task_id, (StepDraft(self._next_order(task_id), "Run the follow-up shell command"),))
-        return "shell"
-
-    def _insert_follow_up(self, task_id: str, drafts: tuple[StepDraft, ...]) -> None:
-        """
-        Store follow-up steps and publish the plan.
-
-        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
-        :param drafts: new steps as tuple[StepDraft, ...]. Example: (StepDraft(2, "Write the thesis"),)
-        :return: None. Example: None
-        """
-        self._plan.insert_steps(self._connection, task_id, drafts)
-        self._publish_phase(task_id, "planning")
-        logger.info("worker.task | shell_follow_up | task_id=%s count=%s", task_id, len(drafts))
-
-    def _close_or_stop_shell_plan(self, task_id: str, completion: Completion) -> str:
-        """
-        Keep a prose reply on the pin. Prose does not finish the goal.
-
-        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
-        :param completion: follow-up turn as Completion. Example: Completion(final_answer="The thesis is the canvas.")
-        :return: "failed" as str. Example: "failed"
-        """
-        text = _follow_up_text(completion)
-        if text:
-            self._blackboard.append_reasoning(
-                self._connection,
-                task_id,
-                ReasoningNote(_utc_now(), self._next_order(task_id) - 1, text),
-            )
-            logger.info("worker.task | shell_plan_prose | task_id=%s reply_len=%s", task_id, len(text))
-        return self._stop_unfinished_shell_plan(task_id)
-
-    def _stop_unfinished_shell_plan(self, task_id: str) -> str:
-        """
-        Fail the pin because a finished command is not the goal.
-
-        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
-        :return: "failed" as str. Example: "failed"
-        """
-        self.failure_reason = _SHELL_PLAN_NOT_THE_GOAL
-        self._blackboard.append_reasoning(
-            self._connection,
-            task_id,
-            ReasoningNote(_utc_now(), 0, "The shell command finished. The goal is not met."),
-        )
-        logger.info("worker.task | shell_plan_open | task_id=%s", task_id)
-        return "failed"
-
-    def _next_order(self, task_id: str) -> int:
-        """
-        Return the order for the next inserted step.
-
-        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
-        :return: order as int. Example: 2
-        """
-        steps = self._plan.list_steps(self._connection, task_id)
-        if not steps:
-            return _MIN_STEP_ORDER
-        return steps[-1].order + 1
-
-    def _continuation_prompt(self, task_id: str) -> str:
-        """
-        Tell the model the shell command finished and show that command's result.
-
-        :param task_id: pin id as str. Example: "7c1e0a2e-3b4d-4f5a-9c8d-1a2b3c4d5e6f"
-        :return: prompt as str. Example: "Foundation\\nPrior synthesis: step 1: pdftotext\\nexit 0"
-        """
-        pin = self._require_pin(task_id)
-        last_result = pin.reasoning[-1].text if pin.reasoning else ""
-        prompt = self._prompt.assemble(
-            pin.goal,
-            pin.done_when,
-            pin.access,
-            (),
-            pin.current_plan,
-            last_result,
-        )
-        return (
-            prompt
-            + "\n\nThe shell command finished. That command is not the goal. "
-            + "Reply with the remaining numbered steps, or one shell command that writes the result. "
-            + "A prose reply does not finish the task."
-        )
+        return self._complete_open_step(task_id, order, "Ran the shell command from the recovery turn")
 
     def _planning_prompt(self, pin: TaskPin) -> str:
         """
@@ -874,27 +720,6 @@ def _shell_note(order: int, command: str, envelope: ToolEnvelope) -> str:
     else:
         body = f"step {order} failed: {head}\n{envelope.error}"
     return _clip(body.strip(), _NOTE_CLIP)
-
-
-def _follow_up_text(completion: Completion) -> str:
-    """
-    Take the prose the model returned when it did not call a tool.
-
-    :param completion: follow-up turn as Completion. Example: Completion(final_answer="The thesis is the canvas.")
-    :return: reply as str. Example: "The thesis is the canvas."
-    """
-    return completion.final_answer.strip() or completion.content.strip()
-
-
-def _shifted_drafts(drafts: list[StepDraft], start: int) -> tuple[StepDraft, ...]:
-    """
-    Renumber drafts so they follow steps that are already stored.
-
-    :param drafts: parsed drafts as list[StepDraft]. Example: [StepDraft(1, "Write the thesis")]
-    :param start: first new order as int. Example: 2
-    :return: drafts as tuple[StepDraft, ...]. Example: (StepDraft(2, "Write the thesis"),)
-    """
-    return tuple(StepDraft(start + index, draft.action) for index, draft in enumerate(drafts))
 
 
 def _clip(text: str, limit: int) -> str:

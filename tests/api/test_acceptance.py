@@ -193,18 +193,19 @@ def test_stdio_client_summarizes_copied_chapters(tmp_path: Path) -> None:
     _assert_stdout_is_only_jsonrpc(stdout)
 
 
-_PROSE = "The thesis is the canvas. Chapter one introduces the pattern."
-_PROSE_GOAL = "Summarize the notes into summary.md: one thesis, then one line per chapter."
-_PROSE_DONE = "summary.md exists in the job folder and states a thesis."
+_MARKER_GOAL = "Write marker.txt in the job folder."
+_MARKER_DONE = "marker.txt exists"
 
 
-def test_stdio_client_keeps_a_prose_reply_and_does_not_finish(tmp_path: Path) -> None:
-    """A shell command then a chat reply fails the pin and keeps the reply on it."""
-    command = "python3 -c " + shlex.quote("open('summary.md','w').write('raw extract\\n')")
+def test_stdio_client_rejects_a_shell_planning_reply(tmp_path: Path) -> None:
+    """A shell call is not a plan. The numbered step runs later and writes marker.txt."""
+    early = "python3 -c " + shlex.quote("open('early.txt','w').write('early\\n')")
+    write_marker = "python3 -c " + shlex.quote("open('marker.txt','w').write('marker\\n')")
     host, port, server = _start_ollama(
         [
-            _chat("", thinking="Extracting the notes.", command=command),
-            _chat(_PROSE, thinking=""),
+            _chat("", thinking="I will just run it.", command=early),
+            _chat("1. Write marker.txt", thinking="One step is enough."),
+            _chat("Wrote marker.txt", thinking="Writing marker.txt.", command=write_marker),
         ]
     )
     process = _start_dispatcher(tmp_path, host, port)
@@ -218,8 +219,8 @@ def test_stdio_client_keeps_a_prose_reply_and_does_not_finish(tmp_path: Path) ->
             2,
             "submit",
             {
-                "goal": _PROSE_GOAL,
-                "done_when": _PROSE_DONE,
+                "goal": _MARKER_GOAL,
+                "done_when": _MARKER_DONE,
                 "priority": 40,
                 "model": "qwen-14b",
                 "access": {"mode": "job"},
@@ -233,10 +234,48 @@ def test_stdio_client_keeps_a_prose_reply_and_does_not_finish(tmp_path: Path) ->
 
     job = tmp_path / "jobs" / str(accepted["task_id"])
     assert accepted["status"] == "queued"
+    assert pin["status"] == "completed", pin.get("error")
+    assert pin["steps"][0]["action"] == "Write marker.txt"
+    assert not (job / "early.txt").exists()
+    assert (job / "marker.txt").read_text(encoding="utf-8") == "marker\n"
+    _assert_stdout_is_only_jsonrpc(stdout)
+
+
+def test_stdio_client_fails_when_planning_never_numbers_steps(tmp_path: Path) -> None:
+    """Three planning replies with no numbered step fail the pin and run no command."""
+    command = "python3 -c " + shlex.quote("open('should-not-exist.txt','w').write('no\\n')")
+    host, port, server = _start_ollama(
+        [_chat("", thinking="Running it.", command=command) for _index in range(3)]
+    )
+    process = _start_dispatcher(tmp_path, host, port)
+    stdout: list[str] = []
+    try:
+        _send(process, _initialize())
+        _response(process, 1, stdout)
+        _send(process, _initialized())
+        accepted = _tool(
+            process,
+            2,
+            "submit",
+            {
+                "goal": _MARKER_GOAL,
+                "done_when": _MARKER_DONE,
+                "priority": 40,
+                "model": "qwen-14b",
+                "access": {"mode": "job"},
+            },
+            stdout,
+        )
+        pin = _poll_until_terminal(process, str(accepted["task_id"]), stdout)
+    finally:
+        _stop(process)
+        server.shutdown()
+
+    job = tmp_path / "jobs" / str(accepted["task_id"])
     assert pin["status"] == "failed"
-    assert pin["error"] == "shell_plan_not_the_goal"
-    assert any(_PROSE in note["text"] for note in pin["reasoning"])
-    assert (job / "summary.md").read_text(encoding="utf-8") == "raw extract\n"
+    assert pin["error"] == "empty_plan"
+    assert pin["steps"] == []
+    assert not (job / "should-not-exist.txt").exists()
     _assert_stdout_is_only_jsonrpc(stdout)
 
 
@@ -269,7 +308,7 @@ def test_stdio_client_stops_after_three_failed_steps(tmp_path: Path) -> None:
     assert pin["error"] == "failed_step_cap"
     assert len(failed) == 3
     assert len(pin["steps"]) == 3
-    assert _OllamaHandler.chat_posts == 3
+    assert _OllamaHandler.chat_posts == 4
     assert any("failed_step_cap" in note["text"] and "3" in note["text"] for note in pin["reasoning"])
     _assert_stdout_is_only_jsonrpc(stdout)
 
@@ -277,6 +316,7 @@ def test_stdio_client_stops_after_three_failed_steps(tmp_path: Path) -> None:
 def _three_failures() -> list[dict]:
     """Plan with one failing command, then two different failing replacements."""
     return [
+        _chat("1. Run the check", thinking="One numbered step."),
         _chat("", thinking="Trying the first command.", command=_FIRST_FAIL),
         _chat("Run a different check", thinking="The first command failed.", command=_SECOND_FAIL),
         _chat("Run one more check", thinking="The second command failed.", command=_THIRD_FAIL),
