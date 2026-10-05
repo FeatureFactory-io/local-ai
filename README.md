@@ -52,6 +52,7 @@ A rejected call is still a normal MCP result. Check `status`. `rejected` with `r
 | `LOCAL_AI_MODEL_14B` | tag from `ollama list` | Ollama name for `qwen-14b` |
 | `LOCAL_AI_MODEL_24B` | tag from `ollama list` | Ollama name for `qwen-24b` |
 | `LOCAL_AI_HTTP_PORT` | unset for stdio | Set only for the ChatGPT HTTP transport |
+| `LOCAL_AI_BOARD_PORT` | `8766` | Read-only blackboard page. Binds `127.0.0.1` only |
 
 The logical names `qwen-8b`, `qwen-14b`, and `qwen-24b` are what `submit` stores. The `LOCAL_AI_MODEL_*` variables are the tags Ollama actually runs. This machine maps `qwen-8b` to `qwen3.5:9b`, `qwen-14b` to `qwen3:14b`, and `qwen-24b` to `qwen3.5:27b`. Qwen3.5 has no 14B tag. Change the variables if `ollama list` changes.
 
@@ -107,6 +108,16 @@ LOCAL_AI_MODEL_24B=qwen3.5:27b \
 ```
 
 Point ChatGPT at `http://127.0.0.1:8765/mcp`. The process binds `127.0.0.1` only.
+
+## Blackboard page
+
+A read-only page renders the same pins as `list` and `read`. It does not cancel, purge, submit, or reprioritize, and it does not migrate the database.
+
+```bash
+.venv/bin/python -m local_ai.board
+```
+
+Open `http://127.0.0.1:8766/`. The process binds `127.0.0.1` only. `LOCAL_AI_BOARD_PORT` defaults to `8766` so it does not take the MCP HTTP port. `LOCAL_AI_DB` is the same SQLite file the dispatcher uses. The query `status` accepts `queued`, `running`, `completed`, `failed`, or `all` (the default). Any other value is rejected with HTTP 400 and `reason: bad_status`.
 
 ## Tests
 

@@ -71,7 +71,15 @@ plan       → SQLite
 
 ### UI
 
-No product UI. Operators list pins with `list`, inspect one pin with `read`, drop a waiting pin with `cancel`, and remove finished pins with `purge`. The SQLite file remains the store. A later status page can render the same pins.
+Operators still list pins with `list`, inspect one pin with `read`, drop a waiting pin with `cancel`, and remove finished pins with `purge`. The SQLite file remains the store.
+
+The blackboard page is a read-only render of those same pins. It does not cancel, purge, submit, or reprioritize, and it does not migrate. It opens `LOCAL_AI_DB` (default `data/local-ai.sqlite`) read-only.
+
+```bash
+.venv/bin/python -m local_ai.board
+```
+
+The process binds `127.0.0.1` only. `LOCAL_AI_BOARD_PORT` defaults to `8766` so it does not take the MCP HTTP port. Open `http://127.0.0.1:8766/`. Query `status` is `queued`, `running`, `completed`, `failed`, or `all` (the default when the query is omitted). An unknown value is rejected with HTTP 400 and `reason: bad_status`, the same rejection `list` returns. Each job shows status, priority, model, phase, goal, error, created/started/finished times, and queue position when the pin is queued. Running and queued jobs are expanded with `current_plan`, steps, and reasoning. The access grant is not shown. The page reloads every 5 seconds.
 
 ## 2. Integration & API Design
 
