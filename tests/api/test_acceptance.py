@@ -191,6 +191,53 @@ def test_stdio_client_summarizes_copied_chapters(tmp_path: Path) -> None:
     _assert_stdout_is_only_jsonrpc(stdout)
 
 
+_PROSE = "The thesis is the canvas. Chapter one introduces the pattern."
+_PROSE_GOAL = "Summarize the notes into summary.md: one thesis, then one line per chapter."
+_PROSE_DONE = "summary.md exists in the job folder and states a thesis."
+
+
+def test_stdio_client_keeps_a_prose_reply_and_does_not_finish(tmp_path: Path) -> None:
+    """A shell command then a chat reply fails the pin and keeps the reply on it."""
+    command = "python3 -c " + shlex.quote("open('summary.md','w').write('raw extract\\n')")
+    host, port, server = _start_ollama(
+        [
+            _chat("", thinking="Extracting the notes.", command=command),
+            _chat(_PROSE, thinking=""),
+        ]
+    )
+    process = _start_dispatcher(tmp_path, host, port)
+    stdout: list[str] = []
+    try:
+        _send(process, _initialize())
+        _response(process, 1, stdout)
+        _send(process, _initialized())
+        accepted = _tool(
+            process,
+            2,
+            "submit",
+            {
+                "goal": _PROSE_GOAL,
+                "done_when": _PROSE_DONE,
+                "priority": 40,
+                "model": "qwen-14b",
+                "access": {"mode": "job"},
+            },
+            stdout,
+        )
+        pin = _poll_until_terminal(process, str(accepted["task_id"]), stdout)
+    finally:
+        _stop(process)
+        server.shutdown()
+
+    job = tmp_path / "jobs" / str(accepted["task_id"])
+    assert accepted["status"] == "queued"
+    assert pin["status"] == "failed"
+    assert pin["error"] == "shell_plan_not_the_goal"
+    assert any(_PROSE in note["text"] for note in pin["reasoning"])
+    assert (job / "summary.md").read_text(encoding="utf-8") == "raw extract\n"
+    _assert_stdout_is_only_jsonrpc(stdout)
+
+
 def _write_chapters(tmp_path: Path) -> list[str]:
     """Write the two source chapters and return their paths."""
     folder = tmp_path / "chapters"

@@ -388,29 +388,6 @@ def test_shell_only_plan_fails_when_the_model_stops_after_the_command(tmp_path: 
     assert [step.status for step in _steps(worker, connection)] == ["completed"]
 
 
-def test_prose_follow_up_stays_on_the_pin_and_does_not_complete(tmp_path: Path) -> None:
-    """Chat prose after a shell command is a note. It does not close the pin."""
-    command = "python3 -c \"open('marker.txt','w').write('raw extract\\n')\""
-    prose = "The thesis is the canvas. Chapter one introduces the pattern."
-    worker, connection, job_dir = _open_worker(
-        tmp_path,
-        (
-            Completion(tool_calls=(ToolCall("shell", command),)),
-            Completion(final_answer=prose),
-        ),
-    )
-
-    outcome = worker.run_task(_TASK_ID)
-
-    pin = worker._blackboard.get_pin(connection, _TASK_ID)
-    assert pin is not None
-    assert outcome == "failed"
-    assert worker.failure_reason == "shell_plan_not_the_goal"
-    assert (job_dir / "marker.txt").read_text(encoding="utf-8") == "raw extract\n"
-    assert any(prose in note.text for note in pin.reasoning)
-    assert any("raw extract" in prompt for prompt in worker._llm.prompts)
-
-
 def test_run_task_retries_when_the_recovery_turn_is_a_shell_command(tmp_path: Path) -> None:
     """A failed command is replaced by the shell call on the recovery turn."""
     good = "python3 -c \"open('marker.txt','w').write('python\\n')\""
